@@ -37,7 +37,7 @@
 #endif
 #include "url.h"
 
-#define IO_BUFFER_SIZE 32768
+#define IO_BUFFER_SIZE 262144
 #define NETWORK_IO_BUFFER_SIZE 262144
 
 /** @name Logging context. */
