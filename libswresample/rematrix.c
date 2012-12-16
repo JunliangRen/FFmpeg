@@ -716,6 +716,8 @@ av_cold int swri_rematrix_build(SwrContext *s)
     int nb_in  = s->used_ch_layout.nb_channels;
     int nb_out = s->out.ch_count;
 
+    s->clip_max = 1.0f;
+
     if (!s->rematrix_custom) {
         int r = auto_matrix(s);
         if (r)
@@ -871,7 +873,7 @@ int swri_rematrix(SwrContext *s, AudioData *out, AudioData *in, int len, int mus
 
     if(s->mix_any_f) {
         s->mix_any_f(out->ch, (const uint8_t *const *)in->ch, s->native_matrix, len);
-        return 0;
+        goto clip_protection;
     }
 
     if(s->mix_2_1_simd || s->mix_1_1_simd){
@@ -942,5 +944,22 @@ int swri_rematrix(SwrContext *s, AudioData *out, AudioData *in, int len, int mus
             }
         }
     }
+
+clip_protection:
+    if (s->clip_protection && s->int_sample_fmt == AV_SAMPLE_FMT_FLTP)
+    {
+        for(j = 0; j < out->ch_count; j++) {
+            for(i = 0; i < len; i++) {
+                const float sample = fabsf(((float *)out->ch[j])[i]);
+                if (sample > s->clip_max) {
+                    s->clip_max = sample;
+                    av_log(s, AV_LOG_INFO, "Clipping protection at %.3f\n", sample);
+                }
+                if (s->clip_max > 1.0f)
+                    ((float *)out->ch[j])[i] /= s->clip_max;
+            }
+        }
+    }
+
     return 0;
 }
