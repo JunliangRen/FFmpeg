@@ -47,6 +47,23 @@ REF_FILTER_3TAP_FUNC( 8, sse2)
 REF_FILTER_3TAP_FUNC(16, sse2)
 REF_FILTER_3TAP_FUNC(32, sse2)
 
+#include "libavcodec/x86/hevc/pred.h"
+
+#undef FUNC
+#define FUNC(a, depth) a ## _ ## depth ## _sse
+
+#define HEVC_PRED(depth)                      \
+    hpc->pred_planar[0]  = FUNC(pred_planar_0, depth);  \
+    hpc->pred_planar[1]  = FUNC(pred_planar_1, depth);  \
+    hpc->pred_planar[2]  = FUNC(pred_planar_2, depth);  \
+    hpc->pred_planar[3]  = FUNC(pred_planar_3, depth);  \
+    hpc->pred_angular[0] = FUNC(pred_angular_0, depth); \
+    hpc->pred_angular[1] = FUNC(pred_angular_1, depth); \
+    hpc->pred_angular[2] = FUNC(pred_angular_2, depth); \
+    hpc->pred_angular[3] = FUNC(pred_angular_3, depth)
+    
+
+
 av_cold void ff_hevc_pred_init_x86(HEVCPredContext *hpc, int bit_depth)
 {
     int cpu_flags = av_get_cpu_flags();
@@ -62,6 +79,25 @@ av_cold void ff_hevc_pred_init_x86(HEVCPredContext *hpc, int bit_depth)
             hpc->pred_planar[1] = ff_hevc_pred_planar_1_8_ssse3;
             hpc->pred_planar[2] = ff_hevc_pred_planar_2_8_ssse3;
             hpc->pred_planar[3] = ff_hevc_pred_planar_3_8_ssse3;
+        }
+
+        if (HAVE_SSE42 && EXTERNAL_SSE42(cpu_flags)) {
+            hpc->pred_angular[0] = FUNC(pred_angular_0, 8);
+            hpc->pred_angular[1] = FUNC(pred_angular_1, 8);
+            hpc->pred_angular[2] = FUNC(pred_angular_2, 8);
+            hpc->pred_angular[3] = FUNC(pred_angular_3, 8);
+        }
+    }
+    if (bit_depth == 10) {
+        if (HAVE_SSE42 && EXTERNAL_SSE42(cpu_flags)) {
+            hpc->pred_planar[0]  = FUNC(pred_planar_0, 10);
+            hpc->pred_planar[1]  = FUNC(pred_planar_1, 10);
+            hpc->pred_planar[2]  = FUNC(pred_planar_2, 10);
+            hpc->pred_planar[3]  = FUNC(pred_planar_3, 10);
+            hpc->pred_angular[0] = FUNC(pred_angular_0, 10);
+            hpc->pred_angular[1] = FUNC(pred_angular_1, 10);
+            hpc->pred_angular[2] = FUNC(pred_angular_2, 10);
+            hpc->pred_angular[3] = FUNC(pred_angular_3, 10);
         }
     }
 }
