@@ -81,14 +81,17 @@ av_cold void ff_hevc_pred_init_x86(HEVCPredContext *hpc, int bit_depth)
             hpc->pred_planar[3] = ff_hevc_pred_planar_3_8_ssse3;
         }
 
+        #ifndef _MSC_VER
         if (EXTERNAL_SSE4(cpu_flags)) {
             hpc->pred_angular[0] = FUNC(pred_angular_0, 8);
             hpc->pred_angular[1] = FUNC(pred_angular_1, 8);
             hpc->pred_angular[2] = FUNC(pred_angular_2, 8);
             hpc->pred_angular[3] = FUNC(pred_angular_3, 8);
         }
+        #endif
     }
     if (bit_depth == 10) {
+        #ifndef _MSC_VER
         if (EXTERNAL_SSE4(cpu_flags)) {
             hpc->pred_planar[0]  = FUNC(pred_planar_0, 10);
             hpc->pred_planar[1]  = FUNC(pred_planar_1, 10);
@@ -99,5 +102,6 @@ av_cold void ff_hevc_pred_init_x86(HEVCPredContext *hpc, int bit_depth)
             hpc->pred_angular[2] = FUNC(pred_angular_2, 10);
             hpc->pred_angular[3] = FUNC(pred_angular_3, 10);
         }
+        #endif
     }
 }
