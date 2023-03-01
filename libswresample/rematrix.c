@@ -696,7 +696,7 @@ av_cold static int auto_matrix(SwrContext *s)
 
     if (s->rematrix_maxval > 0) {
         maxval = s->rematrix_maxval;
-    } else if (   av_get_packed_sample_fmt(s->out_sample_fmt) < AV_SAMPLE_FMT_FLT
+    } else if (   (av_get_packed_sample_fmt(s->out_sample_fmt) < AV_SAMPLE_FMT_FLT && !s->clip_protection)
                || (s->user_int_sample_fmt != AV_SAMPLE_FMT_NONE &&
                    av_get_packed_sample_fmt(s->user_int_sample_fmt) < AV_SAMPLE_FMT_FLT)) {
         maxval = 1.0;
