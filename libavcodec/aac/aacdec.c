@@ -2205,6 +2205,8 @@ static int parse_adts_frame_header(AACDecContext *ac, GetBitContext *gb)
         push_output_configuration(ac);
         if (hdr_info.chan_config) {
             ac->oc[1].m4ac.chan_config = hdr_info.chan_config;
+            /* An explicit ADTS channel configuration replaces an earlier PCE. */
+            ac->oc[1].m4ac.pce = 0;
             if ((ret = ff_aac_set_default_channel_config(ac, ac->avctx,
                                                          layout_map,
                                                          &layout_map_tags,
