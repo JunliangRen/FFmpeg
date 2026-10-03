@@ -2,9 +2,59 @@ The last version increases of all libraries were on 2026-06-23.
 
 API changes, most recent first:
 
-2026-08-13 - xxxxxxxxxx - lavc 63.8.100 - avcodec.h codec.h
+2026-08-xx - xxxxxxxxxx - lavf 63.7.100 - avformat.h
+  Add AV_STREAM_GROUP_PARAMS_GAIN_MAP.
+
+2026-09-30 - xxxxxxxxxx - lavu 61.10.100 - frame.h gain_map.h
+  Add AV_FRAME_DATA_GAIN_MAP_PARAMS.
+  Add AV_ISO21496_VERSION, AV_ISO21496_IDENTIFIER.
+  Add AVGainMapParams.
+  Add av_gain_map_params_validate(), av_gain_map_channels_identical().
+  Add av_gain_map_params_alloc(), av_gain_map_params_create_side_data().
+
+2026-09-27 - xxxxxxxxxx - lavc 63.15.100 - defs.h
+  Add AV_PROFILE_MPEGH_3DA_MAIN, AV_PROFILE_MPEGH_3DA_HIGH
+  AV_PROFILE_MPEGH_3DA_LC, AV_PROFILE_MPEGH_3DA_BL.
+
+2026-09-27 - xxxxxxxxxx - lavu 61.9.100 - channel_layout.h
+  Add AV_CH_LAYOUT_5POINT1POINT6 and AV_CHANNEL_LAYOUT_5POINT1POINT6.
+  Add AV_CH_LAYOUT_7POINT1POINT6 and AV_CHANNEL_LAYOUT_7POINT1POINT6.
+
+2026-09-xx - xxxxxxxxxx - lavu 61.8.100 - file.h
+  Add av_file_map_shared() and av_file_unmap_shared().
+
+2026-09-12 - xxxxxxxxxx - lavc 63.13.100 - codec_id.h, defs.h
+  Add AV_CODEC_ID_ASTC and the AV_PROFILE_ASTC_* profile values.
+
+2026-09-09 - xxxxxxxxxx - lavc 63.12.100 - avcodec.h
+  Add FF_DCT_RVV to enable the RISC-V Vector FDCT implementation.
+
+2026-09-xx - xxxxxxxxxx - lavu 61.7.100 - samplefmt.h
+  Add AV_SAMPLE_FMT_DSD.
+
+2026-09-08 - 053585bc91b - lavc 63.11.101 - mediacodec.h
+  av_mediacodec_release_buffer() and av_mediacodec_render_buffer_at_time()
+  now return AVERROR(ENOENT) when trying to render a buffer that was already
+  released or invalidated by a codec flush.
+
+2026-09-01 - xxxxxxxxxx - lavc 63.10.100 - avcodec.h
+  Add AVCodecContext.skip_pred.
+
+2026-08-28 - xxxxxxxxxx - lavc 63.9.100 - avcodec.h
+  Add FF_BUG_H264_DP_NNZ.
+
+2026-08-23 - xxxxxxxxxx - lavu 61.6.100 - channel_layout.h
+  Add AV_CH_LAYOUT_5POINT1POINT4 and AV_CHANNEL_LAYOUT_5POINT1POINT4.
+  Add AV_CH_LAYOUT_7POINT1POINT4 and AV_CHANNEL_LAYOUT_7POINT1POINT4.
+  Add AV_CH_LAYOUT_9POINT1POINT4 and AV_CHANNEL_LAYOUT_9POINT1POINT4.
+  Deprecate AV_CH_LAYOUT_5POINT1POINT4_BACK, AV_CHANNEL_LAYOUT_5POINT1POINT4_BACK,
+  AV_CH_LAYOUT_7POINT1POINT4_BACK, AV_CHANNEL_LAYOUT_7POINT1POINT4_BACK,
+  AV_CH_LAYOUT_9POINT1POINT4_BACK, AV_CHANNEL_LAYOUT_9POINT1POINT4_BACK.
+  Deprecate AV_CHANNEL_LAYOUT_7POINT1_TOP_BACK.
+
+2026-08-13 - xxxxxxxxxx - lavc 63.8.101 - avcodec.h codec.h
   Add avcodec_encode_reconfigure.
-  Add AV_CODEC_CAP_RECONF.
+  Add AV_CODEC_CAP_ENCODER_RECONF.
 
 2026-08-xx - xxxxxxxxxx - lavf 63.6.100 - avformat.h
   Add AVFMT_FLAG_LEGACY_ID3V2_COMM_KEYS. The deprecated export of id3v2 COMM

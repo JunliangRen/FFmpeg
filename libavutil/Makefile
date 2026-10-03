@@ -37,6 +37,7 @@ HEADERS = adler32.h                                                     \
           file.h                                                        \
           film_grain_params.h                                           \
           frame.h                                                       \
+          gain_map.h                                                    \
           hash.h                                                        \
           hdr_dynamic_metadata.h                                        \
           hdr_dynamic_vivid_metadata.h                                  \
@@ -147,6 +148,7 @@ OBJS = adler32.o                                                        \
        film_grain_params.o                                              \
        fixed_dsp.o                                                      \
        frame.o                                                          \
+       gain_map.o                                                       \
        hash.o                                                           \
        hdr_dynamic_metadata.o                                           \
        hdr_dynamic_vivid_metadata.o                                     \
@@ -260,6 +262,7 @@ TESTPROGS = adler32                                                     \
             aes                                                         \
             aes_ctr                                                     \
             ambient_viewing_environment                                 \
+            atomic                                                      \
             audio_fifo                                                  \
             avstring                                                    \
             base64                                                      \
@@ -278,6 +281,7 @@ TESTPROGS = adler32                                                     \
             dict                                                        \
             display                                                     \
             dovi_meta                                                   \
+            downmix_info                                                \
             encryption_info                                             \
             error                                                       \
             eval                                                        \
@@ -285,6 +289,7 @@ TESTPROGS = adler32                                                     \
             fifo                                                        \
             film_grain_params                                           \
             hash                                                        \
+            hdr_dynamic_metadata                                        \
             hdr_dynamic_vivid_metadata                                  \
             hmac                                                        \
             hwdevice                                                    \
@@ -310,6 +315,7 @@ TESTPROGS = adler32                                                     \
             sha                                                         \
             sha512                                                      \
             samplefmt                                                   \
+            side_data                                                   \
             side_data_array                                             \
             softfloat                                                   \
             spherical                                                   \

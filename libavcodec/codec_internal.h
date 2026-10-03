@@ -49,7 +49,7 @@
  */
 #define FF_CODEC_CAP_SETS_PKT_DTS           (1 << 2)
 /**
- * The decoder extracts and fills its parameters even if the frame is
+ * The decoder extracts and fills its parameters if all frames are
  * skipped due to the skip_frame setting.
  */
 #define FF_CODEC_CAP_SKIP_FRAME_FILL_PARAM  (1 << 3)
@@ -256,17 +256,19 @@ typedef struct FFCodec {
      */
     void (*flush)(struct AVCodecContext *);
 
-    /**
-     * Reconfigure the encoder
-     * Called by avcodec_encode_reconfigure()
-     */
-    int (*reconf)(struct AVCodecContext *avctx, struct AVDictionary **dict);
+    union {
+        /**
+        * Encoding only. Reconfigure the encoder
+        * Called by avcodec_encode_reconfigure()
+        */
+        int (*reconf)(struct AVCodecContext *avctx, struct AVDictionary **dict);
 
-    /**
-     * Decoding only, a comma-separated list of bitstream filters to apply to
-     * packets before decoding.
-     */
-    const char *bsfs;
+        /**
+        * Decoding only, a comma-separated list of bitstream filters to apply to
+        * packets before decoding.
+        */
+        const char *bsfs;
+    };
 
     /**
      * Array of pointers to hardware configurations supported by the codec,

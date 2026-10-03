@@ -1008,9 +1008,6 @@ void ff_hevc_dsp_init_x86(HEVCDSPContext *c, const int bit_depth)
         }
 #endif
     } else if (bit_depth == 10) {
-        if (EXTERNAL_MMXEXT(cpu_flags)) {
-            c->add_residual[0] = ff_hevc_add_residual_4_10_mmxext;
-        }
         if (EXTERNAL_SSE2(cpu_flags)) {
             c->hevc_v_loop_filter_chroma = ff_hevc_v_loop_filter_chroma_10_sse2;
             c->hevc_h_loop_filter_chroma = ff_hevc_h_loop_filter_chroma_10_sse2;
@@ -1033,6 +1030,7 @@ void ff_hevc_dsp_init_x86(HEVCDSPContext *c, const int bit_depth)
             c->idct[1]    = ff_hevc_idct_8x8_10_sse2;
             c->transform_4x4_luma = ff_hevc_transform_4x4_luma_10_sse2;
 
+            c->add_residual[0] = ff_hevc_add_residual_4_10_sse2;
             c->add_residual[1] = ff_hevc_add_residual_8_10_sse2;
             c->add_residual[2] = ff_hevc_add_residual_16_10_sse2;
             c->add_residual[3] = ff_hevc_add_residual_32_10_sse2;
@@ -1301,38 +1299,4 @@ void ff_hevc_dsp_init_x86(HEVCDSPContext *c, const int bit_depth)
             SAO_EDGE_INIT(12, avx2);
         }
     }
-}
-
-#include "libavcodec/hevc/pred.h"
-#include "libavcodec/x86/hevc/pred.h"
-
-#undef FUNC
-#define FUNC(a, depth) a ## _ ## depth ## _sse
-
-#define HEVC_PRED(depth)                      \
-    hpc->pred_planar[0]  = FUNC(pred_planar_0, depth);  \
-    hpc->pred_planar[1]  = FUNC(pred_planar_1, depth);  \
-    hpc->pred_planar[2]  = FUNC(pred_planar_2, depth);  \
-    hpc->pred_planar[3]  = FUNC(pred_planar_3, depth);  \
-    hpc->pred_angular[0] = FUNC(pred_angular_0, depth); \
-    hpc->pred_angular[1] = FUNC(pred_angular_1, depth); \
-    hpc->pred_angular[2] = FUNC(pred_angular_2, depth); \
-    hpc->pred_angular[3] = FUNC(pred_angular_3, depth)
-
-void ff_hevc_pred_init_x86(HEVCPredContext *hpc, int bit_depth)
-{
-    int mm_flags = av_get_cpu_flags();
-
-#ifndef _MSC_VER
-    if (bit_depth == 8) {
-        if (EXTERNAL_SSE4(mm_flags)) {
-            HEVC_PRED(8);
-        }
-    }
-    if (bit_depth == 10) {
-        if (EXTERNAL_SSE4(mm_flags)) {
-            HEVC_PRED(10);
-        }
-    }
-#endif
 }

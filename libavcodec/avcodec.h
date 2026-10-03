@@ -1358,6 +1358,7 @@ typedef struct AVCodecContext {
 #define FF_BUG_MS               8192 ///< Work around various bugs in Microsoft's broken decoders.
 #define FF_BUG_TRUNCATED       16384
 #define FF_BUG_IEDGE           32768
+#define FF_BUG_H264_DP_NNZ     65536 ///< H.264: JM's nC derivation for partitioned slices.
 
     /**
      * strictly follow the standard (MPEG-4, ...).
@@ -1535,6 +1536,10 @@ typedef struct AVCodecContext {
 #define FF_DCT_ALTIVEC 5
 #define FF_DCT_FAAN    6
 #define FF_DCT_NEON    7
+/**
+ * Select a RISC-V Vector implementation of the forward DCT when available.
+ */
+#define FF_DCT_RVV     8
 
     /**
      * IDCT algorithm, see FF_IDCT_* below.
@@ -1942,6 +1947,16 @@ typedef struct AVCodecContext {
      * - decoding: Set by libavcodec
      */
     enum AVAlphaMode alpha_mode;
+
+    /**
+     * Skip prediction (intra prediction and motion compensation) for
+     * selected frames. When skip_pred and skip_idct both discard a frame,
+     * the decoder may skip all pixel operations for it and output it with
+     * valid metadata and undefined pixels.
+     * - encoding: unused
+     * - decoding: Set by user.
+     */
+    enum AVDiscard skip_pred;
 } AVCodecContext;
 
 /**
@@ -2251,7 +2266,7 @@ int avcodec_open2(AVCodecContext *avctx, const AVCodec *codec, AVDictionary **op
 
 /**
  * Try to reconfigure the encoder with the provided dictionary. May only be used
- * if a codec with AV_CODEC_CAP_RECONF has been opened.
+ * if a codec with AV_CODEC_CAP_ENCODER_RECONF has been opened.
  *
  * Not all options can be changed, and it depends on the encoder. If any of the
  * options can't be applied (Either because the option can't be changed, because

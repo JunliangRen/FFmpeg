@@ -21,6 +21,7 @@
 #include "config.h"
 #include "avassert.h"
 #include "mem.h"
+#include "random_seed.h"
 #include "refstruct.h"
 
 #include "vulkan.h"
@@ -186,6 +187,14 @@ int ff_vk_load_props(FFVulkanContext *s)
                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
     FF_VK_STRUCT_EXT(s, &s->feats, &s->atomic_float_feats, FF_VK_EXT_ATOMIC_FLOAT,
                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT);
+#ifdef VK_KHR_unified_image_layouts
+    FF_VK_STRUCT_EXT(s, &s->feats, &s->unified_layout_feats, FF_VK_EXT_UNIFIED_IMAGE_LAYOUTS,
+                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR);
+#endif
+#ifdef VK_KHR_maintenance11
+    FF_VK_STRUCT_EXT(s, &s->feats, &s->maintenance_11_feats, FF_VK_EXT_MAINTENANCE_11,
+                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_11_FEATURES_KHR);
+#endif
 
     if (!s->imageviews_pool) {
         s->imageviews_pool = av_refstruct_pool_alloc_ext(sizeof(FFVkImageViews), 0,
@@ -259,6 +268,16 @@ int ff_vk_load_props(FFVulkanContext *s)
         return AVERROR(ENOMEM);
     }
 
+#ifdef VK_KHR_maintenance9
+    s->ownership_props = av_calloc(s->tot_nb_qfs, sizeof(*s->ownership_props));
+    if (!s->ownership_props) {
+        av_freep(&s->qf_props);
+        av_freep(&s->query_props);
+        av_freep(&s->video_props);
+        return AVERROR(ENOMEM);
+    }
+#endif
+
     for (uint32_t i = 0; i < s->tot_nb_qfs; i++) {
         s->qf_props[i] = (VkQueueFamilyProperties2) {
             .sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2,
@@ -268,6 +287,10 @@ int ff_vk_load_props(FFVulkanContext *s)
                          VK_STRUCTURE_TYPE_QUEUE_FAMILY_QUERY_RESULT_STATUS_PROPERTIES_KHR);
         FF_VK_STRUCT_EXT(s, &s->qf_props[i], &s->video_props[i], FF_VK_EXT_VIDEO_QUEUE,
                          VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR);
+#ifdef VK_KHR_maintenance9
+        FF_VK_STRUCT_EXT(s, &s->qf_props[i], &s->ownership_props[i], FF_VK_EXT_MAINTENANCE_9,
+                         VK_STRUCTURE_TYPE_QUEUE_FAMILY_OWNERSHIP_TRANSFER_PROPERTIES_KHR);
+#endif
     }
 
     vk->GetPhysicalDeviceQueueFamilyProperties2(s->hwctx->phys_dev, &s->tot_nb_qfs, s->qf_props);
@@ -307,6 +330,8 @@ AVVulkanDeviceQueueFamily *ff_vk_qf_find(FFVulkanContext *s,
     return NULL;
 }
 
+static void exec_discard_deps(FFVulkanContext *s, FFVkExecContext *e);
+
 void ff_vk_exec_pool_free(FFVulkanContext *s, FFVkExecPool *pool)
 {
     FFVulkanFunctions *vk = &s->vkfn;
@@ -314,13 +339,18 @@ void ff_vk_exec_pool_free(FFVulkanContext *s, FFVkExecPool *pool)
     for (int i = 0; i < pool->pool_size; i++) {
         FFVkExecContext *e = &pool->contexts[i];
 
-        if (e->fence) {
-            if (e->had_submission)
-                vk->WaitForFences(s->hwctx->act_dev, 1, &e->fence, VK_TRUE, UINT64_MAX);
-            vk->DestroyFence(s->hwctx->act_dev, e->fence, s->hwctx->alloc);
+        if (e->sem) {
+            VkSemaphoreWaitInfo sem_wait_info = {
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                .semaphoreCount = 1,
+                .pSemaphores = &e->sem,
+                .pValues = &e->sem_value,
+            };
+            vk->WaitSemaphores(s->hwctx->act_dev, &sem_wait_info, UINT64_MAX);
+            vk->DestroySemaphore(s->hwctx->act_dev, e->sem, s->hwctx->alloc);
         }
 
-        ff_vk_exec_discard_deps(s, e);
+        exec_discard_deps(s, e);
         pthread_mutex_destroy(&e->lock);
     }
 
@@ -352,6 +382,18 @@ void ff_vk_exec_pool_free(FFVulkanContext *s, FFVkExecPool *pool)
     av_free(pool->cmd_bufs);
     av_free(pool->contexts);
     pool->pool_size = 0;
+}
+
+/* Per-family, per-library queue selection phases; each library links its own
+ * copy, and pools which benefit from spreading are created by the same one */
+static atomic_uint exec_pool_phase[FF_ARRAY_ELEMS(((AVVulkanDeviceContext *)NULL)->qf)];
+static AVOnce exec_pool_phase_seeded = AV_ONCE_INIT;
+
+static void exec_pool_phase_seed(void)
+{
+    uint32_t seed = av_get_random_seed();
+    for (int i = 0; i < FF_ARRAY_ELEMS(exec_pool_phase); i++)
+        atomic_store_explicit(&exec_pool_phase[i], seed, memory_order_relaxed);
 }
 
 int ff_vk_exec_pool_init(FFVulkanContext *s, AVVulkanDeviceQueueFamily *qf,
@@ -491,19 +533,32 @@ int ff_vk_exec_pool_init(FFVulkanContext *s, AVVulkanDeviceQueueFamily *qf,
     }
 #endif
 
+    /* Video pools are pinned to the phase-picked queue (sessions order their
+     * execution anyway); all other pools rotate starting from it, so pools
+     * advancing in lockstep do not collide. */
+    av_assert1(qf->idx < FF_ARRAY_ELEMS(exec_pool_phase));
+    ff_thread_once(&exec_pool_phase_seeded, exec_pool_phase_seed);
+    uint32_t phase = atomic_fetch_add(&exec_pool_phase[qf->idx], 1);
+    int pin_queue = qf->flags & (VK_QUEUE_VIDEO_DECODE_BIT_KHR |
+                                 VK_QUEUE_VIDEO_ENCODE_BIT_KHR);
+
     /* Init contexts */
     for (int i = 0; i < pool->pool_size; i++) {
         FFVkExecContext *e = &pool->contexts[i];
-        VkFenceCreateInfo fence_create = {
-            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-            .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+        VkSemaphoreTypeCreateInfo sem_type = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+        };
+        VkSemaphoreCreateInfo sem_create = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            .pNext = &sem_type,
         };
 
-        /* Fence */
-        ret = vk->CreateFence(s->hwctx->act_dev, &fence_create, s->hwctx->alloc,
-                              &e->fence);
+        /* Timeline semaphore carrying the busy state */
+        ret = vk->CreateSemaphore(s->hwctx->act_dev, &sem_create, s->hwctx->alloc,
+                                  &e->sem);
         if (ret != VK_SUCCESS) {
-            av_log(s, AV_LOG_ERROR, "Failed to create submission fence: %s\n",
+            av_log(s, AV_LOG_ERROR, "Failed to create submission semaphore: %s\n",
                    ff_vk_ret2str(ret));
             return AVERROR_EXTERNAL;
         }
@@ -519,7 +574,7 @@ int ff_vk_exec_pool_init(FFVulkanContext *s, AVVulkanDeviceQueueFamily *qf,
         e->buf = pool->cmd_bufs[i];
 
         /* Queue index distribution */
-        e->qi = i % qf->num;
+        e->qi = pin_queue ? phase % qf->num : (i + phase) % qf->num;
         e->qf = qf->idx;
         VkDeviceQueueInfo2 qinfo = {
             .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
@@ -574,13 +629,17 @@ FFVkExecContext *ff_vk_exec_get(FFVulkanContext *s, FFVkExecPool *pool)
 
     /* Release the dependencies of every completed context, rather than leaving them held until reuse */
     for (int i = 0; i < pool->pool_size; i++) {
+        uint64_t sem_val;
         FFVkExecContext *e = &pool->contexts[i];
         if (pthread_mutex_trylock(&e->lock))
             continue; /* In use by a recording or submitting thread */
-        if ((e->nb_buf_deps || e->nb_refstruct_deps || e->nb_obj_deps ||
-             e->nb_frame_deps || e->nb_sw_frame_deps) &&
-            vk->GetFenceStatus(s->hwctx->act_dev, e->fence) == VK_SUCCESS)
-            ff_vk_exec_discard_deps(s, e);
+        /* Busy contexts (counter below sem_value) are claimed or executing:
+         * their dependency lists are off-limits */
+        if (vk->GetSemaphoreCounterValue(s->hwctx->act_dev, e->sem, &sem_val) == VK_SUCCESS &&
+            sem_val >= e->sem_value &&
+            (e->nb_buf_deps || e->nb_refstruct_deps || e->nb_obj_deps ||
+             e->nb_frame_deps || e->nb_sw_frame_deps))
+            exec_discard_deps(s, e);
         pthread_mutex_unlock(&e->lock);
     }
 
@@ -590,9 +649,15 @@ FFVkExecContext *ff_vk_exec_get(FFVulkanContext *s, FFVkExecPool *pool)
 void ff_vk_exec_wait(FFVulkanContext *s, FFVkExecContext *e)
 {
     FFVulkanFunctions *vk = &s->vkfn;
+    VkSemaphoreWaitInfo sem_wait_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+        .semaphoreCount = 1,
+        .pSemaphores = &e->sem,
+        .pValues = &e->sem_value,
+    };
     pthread_mutex_lock(&e->lock);
-    vk->WaitForFences(s->hwctx->act_dev, 1, &e->fence, VK_TRUE, UINT64_MAX);
-    ff_vk_exec_discard_deps(s, e);
+    vk->WaitSemaphores(s->hwctx->act_dev, &sem_wait_info, UINT64_MAX);
+    exec_discard_deps(s, e);
     pthread_mutex_unlock(&e->lock);
 }
 
@@ -606,17 +671,20 @@ int ff_vk_exec_start(FFVulkanContext *s, FFVkExecContext *e)
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
+    VkSemaphoreWaitInfo sem_wait_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+        .semaphoreCount = 1,
+        .pSemaphores = &e->sem,
+        .pValues = &e->sem_value,
+    };
 
-    /* Take ownership of the context; held until the end of submission */
     pthread_mutex_lock(&e->lock);
 
-    /* Wait for the fence to be signalled. The fence is only reset once a
-     * fully recorded submission is handed to the queue, so a recording
-     * abandoned after an error leaves the context reusable. */
-    vk->WaitForFences(s->hwctx->act_dev, 1, &e->fence, VK_TRUE, UINT64_MAX);
+    /* Wait out the context's previous execution */
+    vk->WaitSemaphores(s->hwctx->act_dev, &sem_wait_info, UINT64_MAX);
 
     /* Discard queue dependencies */
-    ff_vk_exec_discard_deps(s, e);
+    exec_discard_deps(s, e);
 
     ret = vk->BeginCommandBuffer(e->buf, &cmd_start);
     if (ret != VK_SUCCESS) {
@@ -630,10 +698,22 @@ int ff_vk_exec_start(FFVulkanContext *s, FFVkExecContext *e)
         vk->CmdResetQueryPool(e->buf, pool->query_pool,
                               e->query_idx, pool->nb_queries);
 
+    /* Claim: the semaphore stays below this value until submission completes
+     * or the recording is discarded, keeping every other user away */
+    e->sem_value++;
+    e->sem_sig[e->sem_sig_cnt++] = (VkSemaphoreSubmitInfo) {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .semaphore = e->sem,
+        .value = e->sem_value,
+        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+    };
+
+    pthread_mutex_unlock(&e->lock);
+
     return 0;
 }
 
-void ff_vk_exec_discard_deps(FFVulkanContext *s, FFVkExecContext *e)
+static void exec_discard_deps(FFVulkanContext *s, FFVkExecContext *e)
 {
     FFVulkanFunctions *vk = &s->vkfn;
 
@@ -684,6 +764,22 @@ void ff_vk_exec_discard_deps(FFVulkanContext *s, FFVkExecContext *e)
     e->sem_sig_val_dst_cnt = 0;
 }
 
+void ff_vk_exec_discard(FFVulkanContext *s, FFVkExecContext *e)
+{
+    FFVulkanFunctions *vk = &s->vkfn;
+    VkSemaphoreSignalInfo sig_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+        .semaphore = e->sem,
+        .value = e->sem_value,
+    };
+
+    /* An abandoned recording is exclusively the claimer's: free everything
+     * without the mutex, and un-claim last by signalling the burnt generation */
+    exec_discard_deps(s, e);
+    vk->ResetCommandBuffer(e->buf, 0);
+    vk->SignalSemaphore(s->hwctx->act_dev, &sig_info);
+}
+
 void ff_vk_exec_add_dep_refstruct(FFVulkanContext *s, FFVkExecContext *e,
                                   void *obj)
 {
@@ -722,10 +818,8 @@ int ff_vk_exec_add_dep_sw_frame(FFVulkanContext *s, FFVkExecContext *e,
     av_assert1(e->nb_sw_frame_deps < FF_VK_EXEC_MAX_SW_FRAME_DEPS);
 
     e->sw_frame_deps[e->nb_sw_frame_deps] = av_frame_clone(f);
-    if (!e->sw_frame_deps[e->nb_sw_frame_deps]) {
-        ff_vk_exec_discard_deps(s, e);
+    if (!e->sw_frame_deps[e->nb_sw_frame_deps])
         return AVERROR(ENOMEM);
-    }
 
     e->nb_sw_frame_deps++;
 
@@ -739,6 +833,20 @@ void ff_vk_exec_add_dep_wait_sem(FFVulkanContext *s, FFVkExecContext *e,
     av_assert1(e->sem_wait_cnt < FF_VK_EXEC_MAX_SEM_OPS);
 
     e->sem_wait[e->sem_wait_cnt++] = (VkSemaphoreSubmitInfo) {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .semaphore = sem,
+        .value = val,
+        .stageMask = stage,
+    };
+}
+
+void ff_vk_exec_add_dep_signal_sem(FFVulkanContext *s, FFVkExecContext *e,
+                                   VkSemaphore sem, uint64_t val,
+                                   VkPipelineStageFlagBits2 stage)
+{
+    av_assert1(e->sem_sig_cnt < FF_VK_EXEC_MAX_SEM_OPS);
+
+    e->sem_sig[e->sem_sig_cnt++] = (VkSemaphoreSubmitInfo) {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
         .semaphore = sem,
         .value = val,
@@ -798,10 +906,8 @@ int ff_vk_exec_add_dep_frame(FFVulkanContext *s, FFVkExecContext *e, AVFrame *f,
     if (f->buf[0]) {
         av_assert1(e->nb_buf_deps < FF_VK_EXEC_MAX_BUF_DEPS);
         e->buf_deps[e->nb_buf_deps] = av_buffer_ref(f->buf[0]);
-        if (!e->buf_deps[e->nb_buf_deps]) {
-            ff_vk_exec_discard_deps(s, e);
+        if (!e->buf_deps[e->nb_buf_deps])
             return AVERROR(ENOMEM);
-        }
         e->nb_buf_deps++;
     }
 
@@ -900,23 +1006,16 @@ int ff_vk_exec_submit(FFVulkanContext *s, FFVkExecContext *e)
     if (ret != VK_SUCCESS) {
         av_log(s, AV_LOG_ERROR, "Unable to finish command buffer: %s\n",
                ff_vk_ret2str(ret));
-        ff_vk_exec_discard_deps(s, e);
-        pthread_mutex_unlock(&e->lock);
+        ff_vk_exec_discard(s, e);
         return AVERROR_EXTERNAL;
     }
-
-    vk->ResetFences(s->hwctx->act_dev, 1, &e->fence);
 
 #if FF_API_VULKAN_SYNC_QUEUES
 FF_DISABLE_DEPRECATION_WARNINGS
     s->hwctx->lock_queue(s->device, e->qf, e->qi);
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
-    ret = vk->QueueSubmit2(e->queue, 1, &submit_info, e->fence);
-    if (ret != VK_SUCCESS) {
-        /* Keep the context usable, signal with an empty submission */
-        vk->QueueSubmit2(e->queue, 0, NULL, e->fence);
-    }
+    ret = vk->QueueSubmit2(e->queue, 1, &submit_info, VK_NULL_HANDLE);
 #if FF_API_VULKAN_SYNC_QUEUES
 FF_DISABLE_DEPRECATION_WARNINGS
     s->hwctx->unlock_queue(s->device, e->qf, e->qi);
@@ -926,8 +1025,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
     if (ret != VK_SUCCESS) {
         av_log(s, AV_LOG_ERROR, "Unable to submit command buffer: %s\n",
                ff_vk_ret2str(ret));
-        ff_vk_exec_discard_deps(s, e);
-        pthread_mutex_unlock(&e->lock);
+        /* This also un-claims the context by signalling its semaphore */
+        ff_vk_exec_discard(s, e);
         return AVERROR_EXTERNAL;
     }
 
@@ -956,8 +1055,6 @@ FF_ENABLE_DEPRECATION_WARNINGS
     }
 
     e->had_submission = 1;
-
-    pthread_mutex_unlock(&e->lock);
 
     return 0;
 }
@@ -1011,6 +1108,97 @@ int ff_vk_alloc_mem(FFVulkanContext *s, VkMemoryRequirements *req,
         *mem_flags |= s->mprops.memoryTypes[index].propertyFlags;
 
     return 0;
+}
+
+int ff_vk_image_create(FFVulkanContext *s, VkImage *img, VkDeviceMemory *mem,
+                       int width, int height, VkFormat format, int nb_layers,
+                       VkImageTiling tiling, VkImageUsageFlags usage,
+                       VkImageCreateFlags flags, void *create_pnext)
+{
+    int err;
+    VkResult ret;
+    FFVulkanFunctions *vk = &s->vkfn;
+    VkMemoryPropertyFlagBits mem_flags;
+
+    VkImageCreateInfo create_info = {
+        .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext         = create_pnext,
+        .flags         = flags,
+        .imageType     = VK_IMAGE_TYPE_2D,
+        .format        = format,
+        .extent        = { width, height, 1 },
+        .mipLevels     = 1,
+        .arrayLayers   = nb_layers,
+        .tiling        = tiling,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .usage         = usage,
+        .samples       = VK_SAMPLE_COUNT_1_BIT,
+        .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VkMemoryDedicatedAllocateInfo ded_alloc = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+    };
+    VkMemoryRequirements2 req = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+    };
+    VkImageMemoryRequirementsInfo2 req_desc = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+    };
+    VkBindImageMemoryInfo bind_info = {
+        .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+    };
+
+    *img = VK_NULL_HANDLE;
+    *mem = VK_NULL_HANDLE;
+
+    ret = vk->CreateImage(s->hwctx->act_dev, &create_info,
+                          s->hwctx->alloc, img);
+    if (ret != VK_SUCCESS) {
+        av_log(s, AV_LOG_ERROR, "Image creation failure: %s\n",
+               ff_vk_ret2str(ret));
+        return AVERROR_EXTERNAL;
+    }
+
+    req_desc.image = *img;
+    vk->GetImageMemoryRequirements2(s->hwctx->act_dev, &req_desc, &req);
+
+    /* Never shared with another image, so always dedicated */
+    ded_alloc.image = *img;
+    err = ff_vk_alloc_mem(s, &req.memoryRequirements,
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                          &ded_alloc, &mem_flags, mem);
+    if (err < 0)
+        goto fail;
+
+    bind_info.image  = *img;
+    bind_info.memory = *mem;
+    ret = vk->BindImageMemory2(s->hwctx->act_dev, 1, &bind_info);
+    if (ret != VK_SUCCESS) {
+        av_log(s, AV_LOG_ERROR, "Failed to bind image memory: %s\n",
+               ff_vk_ret2str(ret));
+        err = AVERROR_EXTERNAL;
+        goto fail;
+    }
+
+    return 0;
+
+fail:
+    ff_vk_image_free(s, img, mem);
+    return err;
+}
+
+void ff_vk_image_free(FFVulkanContext *s, VkImage *img, VkDeviceMemory *mem)
+{
+    FFVulkanFunctions *vk = &s->vkfn;
+
+    if (*img) {
+        vk->DestroyImage(s->hwctx->act_dev, *img, s->hwctx->alloc);
+        *img = VK_NULL_HANDLE;
+    }
+    if (*mem) {
+        vk->FreeMemory(s->hwctx->act_dev, *mem, s->hwctx->alloc);
+        *mem = VK_NULL_HANDLE;
+    }
 }
 
 int ff_vk_create_buf(FFVulkanContext *s, FFVkBuffer *buf, size_t size,
@@ -1461,8 +1649,9 @@ int ff_vk_init_sampler(FFVulkanContext *s, VkSampler *sampler,
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .magFilter = filt,
         .minFilter = sampler_info.magFilter,
-        .mipmapMode = unnorm_coords ? VK_SAMPLER_MIPMAP_MODE_NEAREST :
-                                      VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .mipmapMode = (unnorm_coords || filt == VK_FILTER_NEAREST) ?
+                      VK_SAMPLER_MIPMAP_MODE_NEAREST :
+                      VK_SAMPLER_MIPMAP_MODE_LINEAR,
         .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
         .addressModeV = sampler_info.addressModeU,
         .addressModeW = sampler_info.addressModeU,
@@ -2042,13 +2231,16 @@ void ff_vk_frame_barrier(FFVulkanContext *s, FFVkExecContext *e,
             break;
         }
 
+    /* Earlier submissions are ordered by the frame's semaphore, which makes
+     * their writes available and visible, so only accesses recorded in this
+     * command buffer belong in the source scope. */
     for (int i = 0; i < nb_images; i++) {
         bar[*nb_bar] = (VkImageMemoryBarrier2) {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
             .pNext = NULL,
             .srcStageMask = src_stage,
             .dstStageMask = dst_stage,
-            .srcAccessMask = found >= 0 ? e->access_dst[found] : vkf->access[i],
+            .srcAccessMask = found >= 0 ? e->access_dst[found] : VK_ACCESS_2_NONE,
             .dstAccessMask = new_access,
             .oldLayout = found >= 0 ? e->layout_dst[found] : vkf->layout[0],
             .newLayout = new_layout,
@@ -2075,6 +2267,11 @@ int ff_vk_shader_load(FFVulkanShader *shd,
     shd->precompiled = 1;
     shd->specialization_info = spec;
     memcpy(shd->lg_size, wg_size, 3*sizeof(uint32_t));
+
+    shd->subgroup_info = (VkPipelineShaderStageRequiredSubgroupSizeCreateInfo) {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .requiredSubgroupSize = required_subgroup_size,
+    };
 
     switch (shd->stage) {
     case VK_SHADER_STAGE_ANY_HIT_BIT_KHR:
@@ -2183,45 +2380,6 @@ static int init_compute_pipeline(FFVulkanContext *s, FFVulkanShader *shd,
     return 0;
 }
 
-static int create_shader_object(FFVulkanContext *s, FFVulkanShader *shd,
-                                const uint8_t *spirv, size_t spirv_len,
-                                size_t *binary_size, const char *entrypoint)
-{
-    VkResult ret;
-    FFVulkanFunctions *vk = &s->vkfn;
-
-    VkShaderCreateInfoEXT shader_obj_create = {
-        .sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
-        .flags = shd->subgroup_info.requiredSubgroupSize ?
-                 VK_SHADER_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT : 0x0,
-        .stage = shd->stage,
-        .nextStage = 0,
-        .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT,
-        .pCode = spirv,
-        .codeSize = spirv_len,
-        .pName = entrypoint,
-        .pSetLayouts = shd->desc_layout,
-        .setLayoutCount = shd->nb_descriptor_sets,
-        .pushConstantRangeCount = shd->push_consts_num,
-        .pPushConstantRanges = shd->push_consts,
-        .pSpecializationInfo = shd->specialization_info,
-    };
-
-    ret = vk->CreateShadersEXT(s->hwctx->act_dev, 1, &shader_obj_create,
-                               s->hwctx->alloc, &shd->object);
-    if (ret != VK_SUCCESS) {
-        av_log(s, AV_LOG_ERROR, "Unable to create shader object: %s\n",
-               ff_vk_ret2str(ret));
-        return AVERROR_EXTERNAL;
-    }
-
-    if (vk->GetShaderBinaryDataEXT(s->hwctx->act_dev, shd->object,
-                                   binary_size, NULL) != VK_SUCCESS)
-        return AVERROR_EXTERNAL;
-
-    return 0;
-}
-
 static int init_descriptors(FFVulkanContext *s, FFVulkanShader *shd)
 {
     VkResult ret;
@@ -2272,7 +2430,8 @@ int ff_vk_shader_link(FFVulkanContext *s, FFVulkanShader *shd,
     FFVulkanFunctions *vk = &s->vkfn;
     VkSpecializationMapEntry spec_entries[3];
     VkSpecializationInfo spec_info;
-    size_t input_size = spirv_len, binary_size = 0;
+    VkShaderModule mod;
+    size_t input_size = spirv_len;
 
     if (shd->precompiled) {
         if (!shd->specialization_info) {
@@ -2318,33 +2477,25 @@ int ff_vk_shader_link(FFVulkanContext *s, FFVulkanShader *shd,
     if (err < 0)
         goto end;
 
-    if (s->extensions & FF_VK_EXT_SHADER_OBJECT) {
-        err = create_shader_object(s, shd, spirv, spirv_len,
-                                   &binary_size, entrypoint);
-        if (err < 0)
-            goto end;
-    } else {
-        VkShaderModule mod;
-        err = create_shader_module(s, shd, &mod, spirv, spirv_len);
-        if (err < 0)
-            goto end;
+    err = create_shader_module(s, shd, &mod, spirv, spirv_len);
+    if (err < 0)
+        goto end;
 
-        switch (shd->bind_point) {
-        case VK_PIPELINE_BIND_POINT_COMPUTE:
-            err = init_compute_pipeline(s, shd, mod, entrypoint);
-            break;
-        default:
-            av_log(s, AV_LOG_ERROR, "Unsupported shader type: %i\n",
-                   shd->bind_point);
-            err = AVERROR(EINVAL);
-            goto end;
-            break;
-        };
+    switch (shd->bind_point) {
+    case VK_PIPELINE_BIND_POINT_COMPUTE:
+        err = init_compute_pipeline(s, shd, mod, entrypoint);
+        break;
+    default:
+        av_log(s, AV_LOG_ERROR, "Unsupported shader type: %i\n",
+               shd->bind_point);
+        err = AVERROR(EINVAL);
+        goto end;
+        break;
+    };
 
-        vk->DestroyShaderModule(s->hwctx->act_dev, mod, s->hwctx->alloc);
-        if (err < 0)
-            goto end;
-    }
+    vk->DestroyShaderModule(s->hwctx->act_dev, mod, s->hwctx->alloc);
+    if (err < 0)
+        goto end;
 
     if (shd->name)
         av_log(s, AV_LOG_VERBOSE, "Shader %s linked, size:", shd->name);
@@ -2353,10 +2504,7 @@ int ff_vk_shader_link(FFVulkanContext *s, FFVulkanShader *shd,
 
     if (input_size != spirv_len)
         av_log(s, AV_LOG_VERBOSE, " %zu compressed,", input_size);
-    av_log(s, AV_LOG_VERBOSE, " %zu SPIR-V", spirv_len);
-    if (binary_size != spirv_len)
-        av_log(s, AV_LOG_VERBOSE, ", %zu binary", binary_size);
-    av_log(s, AV_LOG_VERBOSE, "\n");
+    av_log(s, AV_LOG_VERBOSE, " %zu SPIR-V\n", spirv_len);
 
 end:
     if (shd->precompiled) {
@@ -2594,12 +2742,7 @@ void ff_vk_exec_bind_shader(FFVulkanContext *s, FFVkExecContext *e,
     FFVulkanFunctions *vk = &s->vkfn;
     const FFVulkanShaderData *sd = get_shd_data(e, shd);
 
-    if (s->extensions & FF_VK_EXT_SHADER_OBJECT) {
-        VkShaderStageFlagBits stages = shd->stage;
-        vk->CmdBindShadersEXT(e->buf, 1, &stages, &shd->object);
-    } else {
-        vk->CmdBindPipeline(e->buf, shd->bind_point, shd->pipeline);
-    }
+    vk->CmdBindPipeline(e->buf, shd->bind_point, shd->pipeline);
 
     if (sd && sd->nb_descriptor_sets) {
         if (!shd->use_push) {
@@ -2621,8 +2764,6 @@ void ff_vk_shader_free(FFVulkanContext *s, FFVulkanShader *shd)
                                 s->hwctx->alloc);
 #endif
 
-    if (shd->object)
-        vk->DestroyShaderEXT(s->hwctx->act_dev, shd->object, s->hwctx->alloc);
     if (shd->pipeline)
         vk->DestroyPipeline(s->hwctx->act_dev, shd->pipeline, s->hwctx->alloc);
     if (shd->pipeline_layout)
@@ -2640,6 +2781,9 @@ void ff_vk_uninit(FFVulkanContext *s)
     av_freep(&s->query_props);
     av_freep(&s->qf_props);
     av_freep(&s->video_props);
+#ifdef VK_KHR_maintenance9
+    av_freep(&s->ownership_props);
+#endif
     av_freep(&s->coop_mat_props);
     av_freep(&s->host_image_copy_layouts);
     av_refstruct_pool_uninit(&s->imageviews_pool);

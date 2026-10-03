@@ -421,7 +421,9 @@ struct AVFrame;
  service_provider -- name of the service provider in broadcasting.
  title        -- name of the work.
  track        -- number of this work in the set, can be in form current/total.
- variant_bitrate -- the total bitrate of the bitrate variant that the current stream is part of
+ variant_bitrate -- the total bitrate of the bitrate variant that the program
+                    represents or that the current stream is part of. On
+                    streams it is only set when unambiguous.
  @endverbatim
  *
  * Look in the examples section for an application example how to use the Metadata API.
@@ -1087,8 +1089,9 @@ typedef struct AVStreamGroupTileGrid {
  * AVStreamGroupLayeredVideo is meant to define the relation between a base
  * layer video stream and a separate enhancement layer stream that together
  * form a single layered video presentation (for example a video stream and a
- * data stream containing LCEVC enhancement layer NALUs, or Dolby Vision
- * Profile 7 dual-layer encoding).
+ * data stream containing LCEVC enhancement layer NALUs, Dolby Vision
+ * Profile 7 dual-layer encoding, or a base rendition accompanied by an
+ * ISO 21496-1 gain map).
  *
  * The enhancement layer stream is identified by @ref el_index.
  */
@@ -1153,6 +1156,7 @@ enum AVStreamGroupParamsType {
     AV_STREAM_GROUP_PARAMS_LCEVC,
     AV_STREAM_GROUP_PARAMS_TREF,
     AV_STREAM_GROUP_PARAMS_DOLBY_VISION,
+    AV_STREAM_GROUP_PARAMS_GAIN_MAP,
 };
 
 struct AVIAMFAudioElement;
@@ -2813,7 +2817,7 @@ int av_write_uncoded_frame_query(AVFormatContext *s, int stream_index);
  * May only be called after a successful call to avformat_write_header.
  *
  * @param s media file handle
- * @return 0 if OK, AVERROR_xxx on error
+ * @return >=0 if OK, AVERROR_xxx on error
  */
 int av_write_trailer(AVFormatContext *s);
 

@@ -1992,6 +1992,23 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .props     = AV_CODEC_PROP_LOSSY | AV_CODEC_PROP_LOSSLESS,
         .mime_types= MT("image/webp"),
     },
+    {
+        .id        = AV_CODEC_ID_ASTC,
+        .type      = AVMEDIA_TYPE_VIDEO,
+        .name      = "astc",
+        .long_name = NULL_IF_CONFIG_SMALL("ASTC (Adaptive Scalable Texture Compression)"),
+        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
+        .profiles  = NULL_IF_CONFIG_SMALL(ff_astc_profiles),
+        .mime_types= MT("image/astc"),
+    },
+
+    {
+        .id        = AV_CODEC_ID_H264_MVC,
+        .type      = AVMEDIA_TYPE_VIDEO,
+        .name      = "h264_mvc",
+        .long_name = NULL_IF_CONFIG_SMALL("H264 MVC"),
+        .props     = AV_CODEC_PROP_LOSSY,
+    },
 
     {
         .id        = AV_CODEC_ID_H264_MVC,
@@ -2695,6 +2712,13 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .type      = AVMEDIA_TYPE_AUDIO,
         .name      = "adpcm_ima_escape",
         .long_name = NULL_IF_CONFIG_SMALL("ADPCM IMA Acorn Escape"),
+        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
+    },
+    {
+        .id        = AV_CODEC_ID_ADPCM_RHETOREX,
+        .type      = AVMEDIA_TYPE_AUDIO,
+        .name      = "adpcm_rhetorex",
+        .long_name = NULL_IF_CONFIG_SMALL("ADPCM Rhetorex"),
         .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
     },
 
@@ -3445,6 +3469,7 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .name      = "mpegh_3d_audio",
         .long_name = NULL_IF_CONFIG_SMALL("MPEG-H 3D Audio"),
         .props     = AV_CODEC_PROP_LOSSY,
+        .profiles  = NULL_IF_CONFIG_SMALL(ff_mpegh_3da_profiles),
     },
     {
         .id        = AV_CODEC_ID_SIREN,
