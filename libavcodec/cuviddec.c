@@ -30,6 +30,7 @@
 #include "libavutil/hwcontext.h"
 #include "libavutil/hwcontext_cuda_internal.h"
 #include "libavutil/cuda_check.h"
+#include "libavutil/dict.h"
 #include "libavutil/fifo.h"
 #include "libavutil/log.h"
 #include "libavutil/mem.h"
@@ -99,6 +100,21 @@ typedef struct CuvidContext
 
     int deint_mode;
     int deint_mode_current;
+    int dynamic_deint;
+    int force_deint;
+    int aggressive_deint;
+    int deint_field_order;
+    AVRational deint_framerate;
+    AVRational deint_framerate_fallback;
+    AVRational initial_framerate;
+    AVRational static_source_framerate;
+    AVRational sequence_framerate;
+    int soft_telecine;
+    int soft_telecine_tff;
+    int have_soft_telecine_tff;
+    int queued_pictures;
+    int prev_deint_output;
+    AVRational prev_output_framerate;
     int64_t prev_pts;
     int progressive_sequence;
 
@@ -137,6 +153,12 @@ typedef struct CuvidParsedFrame
     CUVIDPARSERDISPINFO dispinfo;
     int second_field;
     int is_deinterlacing;
+    int map_progressive_frame;
+    int last_field;
+    int deint_output;
+    int repeat_pict;
+    int repeat_top_field_first;
+    AVRational output_framerate;
 } CuvidParsedFrame;
 
 #define CHECK_CU(x) FF_CUDA_CHECK_DL(avctx, ctx->cudl, x)
@@ -265,6 +287,40 @@ static void cuvid_decoder_cleanup_free(void *opaque, uint8_t *data)
 }
 
 #endif
+
+static AVRational cuvid_source_framerate(const CuvidContext *ctx)
+{
+    if (ctx->deint_framerate.num > 0 && ctx->deint_framerate.den > 0)
+        return ctx->deint_framerate;
+    if (ctx->sequence_framerate.num > 0 && ctx->sequence_framerate.den > 0)
+        return ctx->sequence_framerate;
+    if (ctx->deint_framerate_fallback.num > 0 && ctx->deint_framerate_fallback.den > 0)
+        return ctx->deint_framerate_fallback;
+    return ctx->initial_framerate;
+}
+
+/* The opt-in mode keeps an adaptive decoder alive while changing only its
+ * display processing. Do not discard reference pictures at an open GOP. */
+static void cuvid_update_deinterlacing(AVCodecContext *avctx)
+{
+    CuvidContext *ctx = avctx->priv_data;
+    AVRational source_rate = cuvid_source_framerate(ctx);
+
+    ctx->deint_mode_current = ctx->progressive_sequence && !ctx->force_deint
+                              ? cudaVideoDeinterlaceMode_Weave
+                              : ctx->deint_mode;
+
+    if (!ctx->progressive_sequence && ctx->deint_mode_current == cudaVideoDeinterlaceMode_Weave)
+        avctx->flags |= AV_CODEC_FLAG_INTERLACED_DCT;
+    else
+        avctx->flags &= ~AV_CODEC_FLAG_INTERLACED_DCT;
+
+    if (source_rate.num > 0 && source_rate.den > 0) {
+        avctx->framerate = source_rate;
+        if (ctx->deint_mode_current != cudaVideoDeinterlaceMode_Weave && !ctx->drop_second_field)
+            avctx->framerate = av_mul_q(avctx->framerate, (AVRational){2, 1});
+    }
+}
 
 static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* format)
 {
@@ -456,9 +512,22 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
     if (format->bitrate)
         avctx->bit_rate = format->bitrate;
 
+    ctx->sequence_framerate = (AVRational){0, 1};
     if (format->frame_rate.numerator && format->frame_rate.denominator) {
-        avctx->framerate.num = format->frame_rate.numerator;
-        avctx->framerate.den = format->frame_rate.denominator;
+        ctx->sequence_framerate = (AVRational){format->frame_rate.numerator,
+                                             format->frame_rate.denominator};
+        ctx->static_source_framerate = ctx->sequence_framerate;
+    }
+
+    if (ctx->dynamic_deint) {
+        cuvid_update_deinterlacing(avctx);
+    } else {
+        /* Keep the undoubled source rate separately. A sequence without timing
+         * can reuse the caller's or last valid sequence's cadence, even after
+         * another callback has already set avctx to the output field rate. */
+        avctx->framerate = ctx->static_source_framerate;
+        if (ctx->deint_mode_current != cudaVideoDeinterlaceMode_Weave && !ctx->drop_second_field)
+            avctx->framerate = av_mul_q(avctx->framerate, (AVRational){2, 1});
     }
 
     if (ctx->cudecoder && ctx->opaque_output != old_opaque_output) {
@@ -560,8 +629,8 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
     }
 #endif
 
-    if (ctx->deint_mode_current != cudaVideoDeinterlaceMode_Weave && !ctx->drop_second_field) {
-        avctx->framerate = av_mul_q(avctx->framerate, (AVRational){2, 1});
+    if (ctx->dynamic_deint ||
+        (ctx->deint_mode_current != cudaVideoDeinterlaceMode_Weave && !ctx->drop_second_field)) {
         fifo_size_mul = 2;
     }
 
@@ -592,7 +661,8 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
     cuinfo.ulNumOutputSurfaces = ctx->opaque_output ? 0 : 1;
     cuinfo.ulCreationFlags = cudaVideoCreate_PreferCUVID;
     cuinfo.bitDepthMinus8 = format->bit_depth_luma_minus8;
-    cuinfo.DeinterlaceMode = ctx->deint_mode_current;
+    cuinfo.DeinterlaceMode = ctx->dynamic_deint ? cudaVideoDeinterlaceMode_Adaptive
+                                             : ctx->deint_mode_current;
 
     ctx->internal_error = CHECK_CU(ctx->cvdl->cuvidCreateDecoder(&ctx->cudecoder, &cuinfo));
     if (ctx->internal_error < 0)
@@ -785,25 +855,83 @@ static int CUDAAPI cuvid_handle_picture_display(void *opaque, CUVIDPARSERDISPINF
     parsed_frame.dispinfo = *dispinfo;
     ctx->internal_error = 0;
 
-    // For some reason, dispinfo->progressive_frame is sometimes wrong.
-    parsed_frame.dispinfo.progressive_frame = ctx->progressive_sequence;
+    if (ctx->dynamic_deint) {
+        int progressive = ctx->progressive_sequence || dispinfo->progressive_frame;
+        int soft_telecine = 0;
+        int double_rate;
 
-    if (ctx->deint_mode_current == cudaVideoDeinterlaceMode_Weave) {
+        cuvid_update_deinterlacing(avctx);
+        if (ctx->codec_type == cudaVideoCodec_MPEG2 || ctx->codec_type == cudaVideoCodec_H264) {
+            if (dispinfo->repeat_first_field > 0)
+                ctx->soft_telecine = 2;
+            else if (ctx->soft_telecine)
+                ctx->soft_telecine--;
+            soft_telecine = ctx->soft_telecine;
+            if (!soft_telecine || !ctx->have_soft_telecine_tff) {
+                ctx->soft_telecine_tff = dispinfo->top_field_first;
+                ctx->have_soft_telecine_tff = 1;
+            }
+        }
+
+        /* Force is explicit. Auto preserves progressive pictures, while
+         * aggressive processing protects the same soft-telecine window as
+         * LAV's original CUVID backend and never forces progressive VC-1. */
+        if (ctx->force_deint ||
+            (ctx->aggressive_deint && !ctx->progressive_sequence &&
+             ctx->codec_type != cudaVideoCodec_VC1 && !soft_telecine))
+            progressive = 0;
+
+        parsed_frame.dispinfo.progressive_frame = progressive;
+        parsed_frame.map_progressive_frame = ctx->deint_mode == cudaVideoDeinterlaceMode_Weave ||
+                                             (progressive && (!soft_telecine || ctx->progressive_sequence));
+        parsed_frame.is_deinterlacing = !parsed_frame.map_progressive_frame;
+        double_rate = parsed_frame.is_deinterlacing && !ctx->drop_second_field &&
+                      (ctx->force_deint || !soft_telecine);
+        parsed_frame.last_field = !double_rate;
+        parsed_frame.deint_output = parsed_frame.is_deinterlacing ? double_rate ? 2 : 1 : 0;
+        parsed_frame.repeat_pict = double_rate ? 0 : FFMAX(dispinfo->repeat_first_field, 0);
+        parsed_frame.repeat_top_field_first = dispinfo->top_field_first;
+        parsed_frame.output_framerate = cuvid_source_framerate(ctx);
+        if (double_rate) {
+            /* A repeated source field belongs to this picture's total display
+             * interval, rather than being repeated again on both outputs. */
+            AVRational multiplier = {4, 2 + FFMAX(dispinfo->repeat_first_field, 0)};
+            parsed_frame.output_framerate = av_mul_q(parsed_frame.output_framerate, multiplier);
+        }
+        if (parsed_frame.is_deinterlacing && ctx->deint_field_order >= 0)
+            parsed_frame.dispinfo.top_field_first = ctx->deint_field_order;
+        else if (soft_telecine && !ctx->force_deint)
+            parsed_frame.dispinfo.top_field_first = ctx->soft_telecine_tff;
+    } else {
+        // For some reason, dispinfo->progressive_frame is sometimes wrong.
+        parsed_frame.dispinfo.progressive_frame = ctx->progressive_sequence;
+        parsed_frame.is_deinterlacing = ctx->deint_mode_current != cudaVideoDeinterlaceMode_Weave;
+    }
+
+    if (!parsed_frame.is_deinterlacing) {
         ret = av_fifo_write(ctx->frame_queue, &parsed_frame, 1);
         if (ret < 0)
             av_log(avctx, AV_LOG_ERROR, "Writing frame to fifo failed!\n");
     } else {
-        parsed_frame.is_deinterlacing = 1;
         ret = av_fifo_write(ctx->frame_queue, &parsed_frame, 1);
         if (ret < 0)
             av_log(avctx, AV_LOG_ERROR, "Writing first frame to fifo failed!\n");
 
-        if (!ctx->drop_second_field) {
+        if (ctx->dynamic_deint ? parsed_frame.deint_output == 2 : !ctx->drop_second_field) {
             parsed_frame.second_field = 1;
+            parsed_frame.last_field = 1;
             ret = av_fifo_write(ctx->frame_queue, &parsed_frame, 1);
             if (ret < 0)
                 av_log(avctx, AV_LOG_ERROR, "Writing second frame to fifo failed!\n");
         }
+    }
+
+    if (ctx->dynamic_deint) {
+        if (ret < 0) {
+            ctx->internal_error = ret;
+            return 0;
+        }
+        ctx->queued_pictures++;
     }
 
     return 1;
@@ -812,6 +940,11 @@ static int CUDAAPI cuvid_handle_picture_display(void *opaque, CUVIDPARSERDISPINF
 static int cuvid_is_buffer_full(AVCodecContext *avctx)
 {
     CuvidContext *ctx = avctx->priv_data;
+
+    /* A live queue may contain both single and double-rate pictures. Count
+     * actual decode surfaces rather than dividing all entries by one mode. */
+    if (ctx->dynamic_deint)
+        return ctx->queued_pictures + ctx->cuparseinfo.ulMaxDisplayDelay >= ctx->nb_surfaces;
 
     int shift = 0;
     if (ctx->deint_mode != cudaVideoDeinterlaceMode_Weave && !ctx->drop_second_field)
@@ -837,6 +970,9 @@ static int cuvid_decode_packet(AVCodecContext *avctx, const AVPacket *avpkt)
 
     if (is_flush && avpkt && avpkt->size)
         return AVERROR_EOF;
+
+    if (ctx->dynamic_deint)
+        cuvid_update_deinterlacing(avctx);
 
     if (cuvid_is_buffer_full(avctx) && avpkt && avpkt->size)
         return AVERROR(EAGAIN);
@@ -940,9 +1076,21 @@ static int cuvid_output_frame(AVCodecContext *avctx, AVFrame *frame)
         int i;
 
         memset(&params, 0, sizeof(params));
-        params.progressive_frame = parsed_frame.dispinfo.progressive_frame;
+        params.progressive_frame = ctx->dynamic_deint ? parsed_frame.map_progressive_frame
+                                                     : parsed_frame.dispinfo.progressive_frame;
         params.second_field = parsed_frame.second_field;
         params.top_field_first = parsed_frame.dispinfo.top_field_first;
+
+        if (ctx->dynamic_deint) {
+            if (parsed_frame.last_field)
+                ctx->queued_pictures--;
+            if (ctx->prev_deint_output != parsed_frame.deint_output ||
+                av_cmp_q(ctx->prev_output_framerate, parsed_frame.output_framerate))
+                ctx->prev_pts = INT64_MIN;
+            ctx->prev_deint_output = parsed_frame.deint_output;
+            ctx->prev_output_framerate = parsed_frame.output_framerate;
+            avctx->framerate = parsed_frame.output_framerate;
+        }
 
 #ifdef NVDEC_HAVE_OPAQUE_OUTPUT_SUPPORT
         if (avctx->pix_fmt == AV_PIX_FMT_CUARRAY) {
@@ -1189,11 +1337,18 @@ static int cuvid_output_frame(AVCodecContext *avctx, AVFrame *frame)
             frame->pts = parsed_frame.dispinfo.timestamp;
 
         if (parsed_frame.second_field) {
-            if (ctx->prev_pts == INT64_MIN) {
+            if (ctx->dynamic_deint || ctx->prev_pts == INT64_MIN) {
+                if (avctx->pkt_timebase.num <= 0 || avctx->pkt_timebase.den <= 0 ||
+                    avctx->framerate.num <= 0 || avctx->framerate.den <= 0) {
+                    av_log(avctx, AV_LOG_ERROR,
+                           "Cannot time the second field without a valid frame rate and packet timebase\n");
+                    ret = AVERROR_INVALIDDATA;
+                    goto error;
+                }
                 ctx->prev_pts = frame->pts;
-                frame->pts += (avctx->pkt_timebase.den * avctx->framerate.den) / (avctx->pkt_timebase.num * avctx->framerate.num);
+                frame->pts += av_rescale_q(1, av_inv_q(avctx->framerate), avctx->pkt_timebase);
             } else {
-                int pts_diff = (frame->pts - ctx->prev_pts) / 2;
+                int64_t pts_diff = (frame->pts - ctx->prev_pts) / 2;
                 ctx->prev_pts = frame->pts;
                 frame->pts += pts_diff;
             }
@@ -1204,11 +1359,28 @@ static int cuvid_output_frame(AVCodecContext *avctx, AVFrame *frame)
          */
         frame->duration = 0;
 
+        if (ctx->dynamic_deint) {
+            /* Output properties must describe this queued picture, including
+             * when settings have since changed or input metadata used the
+             * same key. Write after frame allocation/transfer has completed. */
+            ret = av_dict_set(&frame->metadata, "lav.cuvid.deinterlaced",
+                              parsed_frame.is_deinterlacing ? "1" : "0", 0);
+            if (ret < 0)
+                goto error;
+            frame->repeat_pict = parsed_frame.repeat_pict;
+            frame->flags &= ~(AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST);
+        }
         if (!parsed_frame.is_deinterlacing && !parsed_frame.dispinfo.progressive_frame)
             frame->flags |= AV_FRAME_FLAG_INTERLACED;
 
-        if ((frame->flags & AV_FRAME_FLAG_INTERLACED) && parsed_frame.dispinfo.top_field_first)
+        if (ctx->dynamic_deint && parsed_frame.repeat_pict > 0) {
+            /* Repeat-field display order describes the original picture, not
+             * the stable field selection used by soft-telecine processing. */
+            if (parsed_frame.repeat_top_field_first)
+                frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        } else if ((frame->flags & AV_FRAME_FLAG_INTERLACED) && parsed_frame.dispinfo.top_field_first) {
             frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        }
     } else if (ctx->decoder_flushing ||
                atomic_load_explicit(&ctx->abort_decode, memory_order_acquire)) {
         ret = AVERROR_EOF;
@@ -1466,6 +1638,11 @@ static av_cold int cuvid_decode_init(AVCodecContext *avctx)
     avctx->pix_fmt = ret;
 
     if (ctx->opaque_output) {
+        if (ctx->dynamic_deint) {
+            av_log(avctx, AV_LOG_ERROR, "Live deinterlacing is not supported with cuarray output\n");
+            ret = AVERROR(EINVAL);
+            goto error;
+        }
         switch (avctx->sw_pix_fmt) {
         case AV_PIX_FMT_YUV444P:      avctx->sw_pix_fmt = AV_PIX_FMT_NV24;  break;
         case AV_PIX_FMT_YUV444P10MSB: avctx->sw_pix_fmt = AV_PIX_FMT_P410;  break;
@@ -1520,7 +1697,12 @@ static av_cold int cuvid_decode_init(AVCodecContext *avctx)
     if(ctx->nb_surfaces < 0)
         ctx->nb_surfaces = CUVID_DEFAULT_NUM_SURFACES;
 
-    ctx->frame_queue = av_fifo_alloc2(ctx->nb_surfaces, sizeof(CuvidParsedFrame), 0);
+    ctx->initial_framerate = avctx->framerate;
+    ctx->static_source_framerate = avctx->framerate;
+    ctx->sequence_framerate = (AVRational){0, 1};
+    ctx->prev_deint_output = -1;
+    ctx->frame_queue = av_fifo_alloc2(ctx->nb_surfaces * (ctx->dynamic_deint ? 2 : 1),
+                                    sizeof(CuvidParsedFrame), 0);
     if (!ctx->frame_queue) {
         ret = AVERROR(ENOMEM);
         goto error;
@@ -1729,6 +1911,10 @@ static void cuvid_flush(AVCodecContext *avctx)
         goto error;
 
     av_fifo_reset2(ctx->frame_queue);
+    ctx->queued_pictures = 0;
+    ctx->prev_deint_output = -1;
+    ctx->soft_telecine = 0;
+    ctx->have_soft_telecine_tff = 0;
 
     if (ctx->cudecoder) {
         ctx->cvdl->cuvidDestroyDecoder(ctx->cudecoder);
@@ -1775,6 +1961,12 @@ static const AVOption options[] = {
     { "gpu",      "GPU to be used for decoding", OFFSET(cu_gpu), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
     { "surfaces", "Maximum surfaces to be used for decoding", OFFSET(nb_surfaces), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, VD | AV_OPT_FLAG_DEPRECATED },
     { "drop_second_field", "Drop second field when deinterlacing", OFFSET(drop_second_field), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
+    { "dynamic_deint", "Allow live adaptive/weave and output-rate changes", OFFSET(dynamic_deint), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
+    { "force_deint", "Force deinterlacing of progressive sequences in live mode", OFFSET(force_deint), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
+    { "deint_field_order", "Override deinterlaced field order in live mode (-1 auto, 0 bottom, 1 top)", OFFSET(deint_field_order), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 1, VD },
+    { "deint_framerate", "Override encoded frame rate in live mode", OFFSET(deint_framerate), AV_OPT_TYPE_RATIONAL, { .dbl = 0 }, 0, INT_MAX, VD },
+    { "deint_framerate_fallback", "Use this source frame rate when live sequence timing is missing", OFFSET(deint_framerate_fallback), AV_OPT_TYPE_RATIONAL, { .dbl = 0 }, 0, INT_MAX, VD },
+    { "aggressive_deint", "Process progressive pictures in interlaced live sequences except soft telecine and VC-1", OFFSET(aggressive_deint), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
     { "crop",     "Crop (top)x(bottom)x(left)x(right)", OFFSET(crop_expr), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
     { "resize",   "Resize (width)x(height)", OFFSET(resize_expr), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
     { "output_format", "Hardware output format", OFFSET(output_format), AV_OPT_TYPE_INT, { .i64 = AV_PIX_FMT_NONE }, AV_PIX_FMT_NONE, INT_MAX, VD, .unit = "output_format" },
