@@ -2664,6 +2664,7 @@ HAVE_LIST="
     $THREADS_LIST
     $TOOLCHAIN_FEATURES
     $TYPES_LIST
+    davs2_10
     ffnvcodec_cuarray
     gzip
     ioctl_posix
@@ -7230,7 +7231,13 @@ enabled libcaca           && require_pkg_config libcaca caca caca.h caca_create_
 enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lcodec2
 enabled libcurl           && check_pkg_config libcurl "libcurl >= 7.88.0" curl/curl.h curl_easy_init
 enabled libdav1d          && require_pkg_config libdav1d "dav1d >= 1.0.0" "dav1d/dav1d.h" dav1d_version
-enabled libdavs2          && require_pkg_config libdavs2 "davs2 >= 1.6.0" davs2.h davs2_decoder_open
+enabled libdavs2          && {
+    require_pkg_config libdavs2 "davs2 >= 1.6.0" davs2.h davs2_decoder_open
+    if check_headers davs2_10.h $libdavs2_cflags; then
+        check_lib davs2_10 davs2_10.h "lav_davs2_10_decoder_open lav_davs2_10_decoder_close lav_davs2_10_decoder_send_packet lav_davs2_10_decoder_recv_frame lav_davs2_10_decoder_flush lav_davs2_10_decoder_frame_unref" $libdavs2_cflags $libdavs2_extralibs ||
+            die "ERROR: davs2_10.h is installed but the complete 10-bit decoder API cannot be linked"
+    fi
+}
 enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new
 enabled libdrm            && check_pkg_config libdrm libdrm xf86drm.h drmGetVersion
 enabled libdvdnav         && require_pkg_config libdvdnav "dvdnav >= 6.1.0" dvdnav/dvdnav.h dvdnav_open2
