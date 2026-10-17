@@ -179,6 +179,22 @@ AVS2-P2/IEEE1857.4 video decoder wrapper.
 
 This decoder allows libavcodec to decode AVS2 streams with davs2 library.
 
+An optional dual-depth build provides both 8-bit and 10-bit AVS2 decoding.
+It requires the @file{davs2_10.h} compatibility header and the six
+@code{lav_davs2_10_decoder_*} entry points, linked alongside the ordinary
+@code{davs2_decoder_*} API by the @code{davs2} pkg-config package.
+All symbols and mutable state of the 10-bit implementation must be isolated
+from the 8-bit library. Configure detects this interface automatically;
+ordinary libdavs2 installations continue to support 8-bit decoding.
+If @file{davs2_10.h} is installed, the complete 10-bit API must link
+successfully or configuration fails.
+
+The wrapper selects the implementation for each decoder context from the
+sequence header's encoding precision. It preserves delayed output when the
+encoding precision changes, and recreates the backend after a seek or flush.
+The AVS2 parser must supply complete start-code units; a sequence header may
+also be supplied as codec extradata.
+
 @c man end VIDEO DECODERS
 
 @section libuavs3d
