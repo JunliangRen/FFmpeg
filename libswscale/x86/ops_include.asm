@@ -19,7 +19,7 @@
 ;******************************************************************************
 
 %include "libavutil/x86/x86util.asm"
-%include "libswscale/x86/uops_macros.gen.asm"
+%include "libswscale/x86/uops_macros.asm"
 
 ; High-level explanation of how the x86 backend works:
 ;
@@ -146,11 +146,14 @@ endstruc
 %define SWS_COMP_INV(mask)      ((mask) ^ SWS_COMP_ALL)
 %define SWS_COMP_ELEMS(N)       ((1 << (N)) - 1)
 
+%define LIN_MASK(I, J) (1 << (5 * (I) + (J)))
+%define LIN_COL(J) (LIN_MASK(0, J) | LIN_MASK(1, J) | LIN_MASK(2, J) | LIN_MASK(3, J))
+
 ;---------------------------------------------------------
 ; Common macros for declaring operations
 
 ; Declare an operation kernel, calling a provided macro to generate the body.
-; Note: This is automatically called by the DECL_*() macros
+; Note: This is automatically called by the DECL_* macros
 %macro DECL_OP 5-6+ ; macro, name, type, uop, mask
     ; Declare named variables for common macro parameters
     %ifdef NAME_SUFFIX
@@ -326,8 +329,14 @@ endstruc
     %endif
 %endmacro
 
-; Alternate name; for nested usage (to work around NASM limitations)
+; Alternate names; for nested usage (to work around NASM limitations)
 %macro IF1 2+
+    %if %1
+        %2
+    %endif
+%endmacro
+
+%macro IF2 2+
     %if %1
         %2
     %endif

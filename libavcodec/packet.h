@@ -387,6 +387,13 @@ enum AVPacketSideDataType {
     AV_PKT_DATA_HEVC_CONF,
 
     /**
+     * Parameters describing how to combine this gain map with its base image
+     * to form an alternate rendition. The payload is the AVGainMapParams
+     * struct defined in libavutil/gain_map.h.
+     */
+    AV_PKT_DATA_GAIN_MAP_PARAMS,
+
+    /**
      * x264 build for this stream
      */
     AV_PKT_DATA_X264_BUILD,

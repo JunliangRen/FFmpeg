@@ -26,7 +26,7 @@
 
 #include "../ops_chain.h"
 #include "../uops.h"
-#include "../uops_macros.h"
+#include "uops_macros.h"
 
 static int setup_rw_packed(const SwsImplParams *params, SwsImplResult *out)
 {
@@ -277,12 +277,52 @@ static int setup_dither(const SwsImplParams *params, SwsImplResult *out)
     return 0;
 }
 
+static void splat_lane(void *dst, SwsPixelType type, SwsPixel px)
+{
+    switch (ff_sws_pixel_type_size(type)) {
+    case 1:
+        memset(dst, px.u8, 16);
+        break;
+    case 2:
+        for (int i = 0; i < 8; i++)
+            ((uint16_t *) dst)[i] = px.u16;
+        break;
+    case 4:
+        for (int i = 0; i < 4; i++)
+            ((uint32_t *) dst)[i] = px.u32;
+        break;
+    }
+}
+
 static int setup_linear(const SwsImplParams *params, SwsImplResult *out)
 {
     const SwsUOp *uop = params->uop;
-    out->priv.ptr = av_memdup(uop->data.mat4, sizeof(uop->data.mat4));
+    if (uop->type == SWS_PIXEL_F32) {
+        out->priv.ptr = av_memdup(uop->data.mat4x5, sizeof(uop->data.mat4x5));
+        out->free = ff_op_priv_free;
+        return out->priv.ptr ? 0 : AVERROR(ENOMEM);
+    }
+
+    uint8_t *mat = av_malloc(4 * 5 * 16); /* one lane per component */
+    if (!mat)
+        return AVERROR(ENOMEM);
+    out->priv.ptr = mat;
     out->free = ff_op_priv_free;
-    return out->priv.ptr ? 0 : AVERROR(ENOMEM);
+
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 5; j++) {
+            SwsPixel px = uop->data.mat4x5[i][j];
+            SwsPixelType type = uop->type;
+            if (type == SWS_PIXEL_U8) {
+                type = SWS_PIXEL_U16; /* for pmullw */
+                px.u16 = (px.u8 << 8) | px.u8;
+            }
+
+            splat_lane(mat, type, px);
+            mat += 16;
+        }
+    }
+    return 0;
 }
 
 static bool uop_is_type_invariant(const SwsUOpType uop)
@@ -662,12 +702,7 @@ static int compile_uops_x86(SwsContext *ctx, const SwsUOpList *uops, SwsCompiled
     memcpy(out->over_read,  chain->over_read,  sizeof(out->over_read));
     memcpy(out->over_write, chain->over_write, sizeof(out->over_write));
 
-    av_log(ctx, AV_LOG_DEBUG, "Compiled micro-ops:\n");
-    for (int i = 0; i < uops->num_ops; i++) {
-        char name[SWS_UOP_NAME_MAX];
-        ff_sws_uop_name(&uops->ops[i], name);
-        av_log(ctx, AV_LOG_DEBUG, "    %s\n", name);
-    }
+    ff_sws_uop_list_print(ctx, AV_LOG_DEBUG, uops);
 
     return 0;
 
@@ -676,14 +711,18 @@ fail:
     return ret;
 }
 
-static int compile_x86(SwsContext *ctx, const SwsOpList *ops, SwsCompiledOp *out)
+static int compile_ops_x86(SwsContext *ctx, const SwsOpList *ops, SwsCompiledOp *out)
 {
     const int cpu_flags = av_get_cpu_flags();
     const int mmsize = get_mmsize();
     if (mmsize < 0)
         return mmsize;
 
-    SwsUOpFlags flags = SWS_UOP_FLAG_PSHUFB;
+    SwsUOpFlags flags = SWS_UOP_FLAG_PSHUFB
+                      | SWS_UOP_FLAG_EXPAND_BIT
+                      | SWS_UOP_FLAG_READ_PALETTE
+                      | SWS_UOP_FLAG_ADD
+                      | SWS_UOP_FLAG_PUNNING;
     if (EXTERNAL_FMA3(cpu_flags))
         flags |= SWS_UOP_FLAG_FMA;
 
@@ -705,7 +744,7 @@ fail:
 const SwsOpBackend backend_x86 = {
     .name           = "x86",
     .flags          = SWS_BACKEND_X86,
-    .compile        = compile_x86,
+    .compile        = compile_ops_x86,
     .compile_uops   = compile_uops_x86,
     .hw_format      = AV_PIX_FMT_NONE,
 };

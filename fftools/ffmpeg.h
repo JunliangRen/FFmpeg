@@ -322,6 +322,7 @@ typedef struct OutputFilterOptions {
     enum AVColorSpace   color_space;
     enum AVColorRange   color_range;
     enum AVAlphaMode    alpha_mode;
+    enum AVChromaLocation chroma_location;
 
     unsigned            crop_top;
     unsigned            crop_bottom;
@@ -345,6 +346,7 @@ typedef struct OutputFilterOptions {
     const enum AVColorSpace  *color_spaces;
     const enum AVColorRange  *color_ranges;
     const enum AVAlphaMode   *alpha_modes;
+    const enum AVChromaLocation *chroma_locations;
 
     AVFrameSideData   **side_data;
     int                 nb_side_data;
@@ -768,7 +770,7 @@ extern float max_error_rate;
 
 extern char *filter_nbthreads;
 extern int filter_complex_nbthreads;
-extern int filter_buffered_frames;
+extern int filter_buffered_frames[AVMEDIA_TYPE_NB];
 extern int vstats_version;
 extern int print_graphs;
 extern char *print_graphs_file;

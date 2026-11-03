@@ -39,8 +39,8 @@
 #define ARIBC_BPRINT_SIZE_INIT         64
 #define ARIBC_BPRINT_SIZE_MAX          (8 * 1024)
 #define ARIBC_ALPHA_MAX_NUM            4
-#define ARIBC_ALPHA_DEFAULT_FRONT      0xFF
-#define ARIBC_ALPHA_DEFAULT_BACK       0x80
+#define ARIBC_ALPHA_DEFAULT_FRONT      0xFFu
+#define ARIBC_ALPHA_DEFAULT_BACK       0x80u
 
 #define ARIBCC_COLOR_RGB(c)            ((c) & 0xFFFFFF)
 #define ARIBCC_COLOR_DIFF_RGB(c1,c2)   (((c1) ^ (c2)) & 0x00FFFFFF)
@@ -310,7 +310,7 @@ static void clut_init(ARIBCaptionContext *ctx, aribcc_caption_region_t *region)
  * Transfer decoded subtitle to AVSubtitle with corresponding subtitle type.
  *
  * @param ctx pointer to the ARIBCaptionContext
- * @return > 0 number of rectangles to be displayed
+ * @return > 0 subtitle event produced (possibly with zero rectangles for clear)
  *         = 0 no subtitle
  *         < 0 error code
  */
@@ -360,6 +360,17 @@ static int aribcaption_trans_bitmap_subtitle(ARIBCaptionContext *ctx)
 
     case ARIBCC_RENDER_STATUS_NO_IMAGE:
         ff_dlog(ctx, "no image\n");
+        /* A caption carrying an explicit clear screen (CS) produces no
+           image. Report an empty subtitle so that the previously displayed
+           bitmap is erased; the TEXT path already does this by emitting "".
+           Do not treat every regionless caption as a clear: a statement
+           containing only TIME also decodes to zero regions but must not
+           erase the display. */
+        if (ctx->caption.flags & ARIBCC_CAPTIONFLAGS_CLEARSCREEN) {
+            sub->format = 0; /* graphic */
+            sub->num_rects = 0;
+            return 1;
+        }
         return 0;
 
     case ARIBCC_RENDER_STATUS_ERROR:
@@ -377,6 +388,11 @@ static int aribcaption_trans_bitmap_subtitle(ARIBCaptionContext *ctx)
     if (!ctx->render_result.image_count || ctx->render_result.images == NULL) {
         aribcc_render_result_cleanup(&ctx->render_result);
         ff_dlog(ctx, "no image (%d)\n", ctx->render_result.image_count);
+        if (ctx->caption.flags & ARIBCC_CAPTIONFLAGS_CLEARSCREEN) {
+            sub->format = 0; /* graphic */
+            sub->num_rects = 0;
+            return 1;
+        }
         return 0;
     }
 

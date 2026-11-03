@@ -425,6 +425,7 @@ typedef struct TLSContext {
     TLSShared tls_shared;
     SSL_CTX *ctx;
     SSL *ssl;
+    int do_shutdown;
     BIO_METHOD* url_bio_method;
     int io_err;
     char error_message[256];
@@ -483,10 +484,16 @@ static int print_ssl_error(URLContext *h, int ret)
 {
     TLSContext *c = h->priv_data;
     int printed = 0, e, averr = AVERROR(EIO);
+    int err = SSL_get_error(c->ssl, ret);
     if (h->flags & AVIO_FLAG_NONBLOCK) {
-        int err = SSL_get_error(c->ssl, ret);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
             return AVERROR(EAGAIN);
+    }
+    switch (err) {
+    case SSL_ERROR_SSL:
+    case SSL_ERROR_SYSCALL:
+        c->do_shutdown = 0;
+        break;
     }
     while ((e = ERR_get_error()) != 0) {
         av_log(h, AV_LOG_ERROR, "%s\n", ERR_error_string(e, NULL));
@@ -507,7 +514,8 @@ static int tls_close(URLContext *h)
 {
     TLSContext *c = h->priv_data;
     if (c->ssl) {
-        SSL_shutdown(c->ssl);
+        if (c->do_shutdown)
+            SSL_shutdown(c->ssl);
         SSL_free(c->ssl);
     }
     if (c->ctx)
@@ -572,8 +580,9 @@ static int url_bio_bwrite(BIO *b, const char *buf, int len)
         return ret;
     BIO_clear_retry_flags(b);
     if (ret == AVERROR_EXIT)
-        return 0;
-    if (ret == AVERROR(EAGAIN))
+        /* Don't return 0: that signals success and silently drops the data. */
+        c->io_err = ret;
+    else if (ret == AVERROR(EAGAIN))
         BIO_set_retry_write(b);
     else
         c->io_err = ret;
@@ -649,9 +658,11 @@ static int dtls_handshake(URLContext *h)
             goto end;
         }
 
+        ERR_clear_error();
         ret = SSL_do_handshake(c->ssl);
         if (ret == 1) {
             av_log(c, AV_LOG_TRACE, "Handshake success\n");
+            c->do_shutdown = 1;
             break;
         }
         err = SSL_get_error(c->ssl, ret);
@@ -708,6 +719,14 @@ static av_cold int openssl_init_ca_key_cert(URLContext *h)
             av_log(h, AV_LOG_WARNING, "Failure setting default verify locations: %s\n",
                 openssl_get_error(c));
         }
+#if defined(_WIN32) && !defined(OPENSSL_NO_WINSTORE) && \
+    OPENSSL_VERSION_NUMBER >= 0x30200000L /* OpenSSL 3.2 */
+        // Windows has no default CA directory, so also trust its ROOT system store
+        if (!SSL_CTX_load_verify_store(c->ctx, "org.openssl.winstore://")) {
+            av_log(h, AV_LOG_WARNING, "Failure registering the Windows certificate store: %s\n",
+                openssl_get_error(c));
+        }
+#endif
     }
 
     if (s->cert_file) {
@@ -907,6 +926,7 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
         }
         av_log(c, AV_LOG_VERBOSE, "Setup ok, MTU=%d\n", c->tls_shared.mtu);
     } else {
+        ERR_clear_error();
         ret = s->listen ? SSL_accept(c->ssl) : SSL_connect(c->ssl);
         if (ret == 0) {
             av_log(h, AV_LOG_ERROR, "Unable to negotiate TLS/SSL session\n");
@@ -916,6 +936,7 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
             ret = print_ssl_error(h, ret);
             goto fail;
         }
+        c->do_shutdown = 1;
     }
 
     return 0;
@@ -941,6 +962,7 @@ static int tls_read(URLContext *h, uint8_t *buf, int size)
     // Set or clear the AVIO_FLAG_NONBLOCK on the underlying socket
     uc->flags &= ~AVIO_FLAG_NONBLOCK;
     uc->flags |= h->flags & AVIO_FLAG_NONBLOCK;
+    ERR_clear_error();
     ret = SSL_read(c->ssl, buf, size);
     if (ret > 0)
         return ret;
@@ -965,6 +987,7 @@ static int tls_write(URLContext *h, const uint8_t *buf, int size)
         size = FFMIN(size, mtu_size);
     }
 
+    ERR_clear_error();
     ret = SSL_write(c->ssl, buf, size);
     if (ret > 0)
         return ret;

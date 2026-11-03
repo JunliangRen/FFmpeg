@@ -17,7 +17,6 @@ OBJS = allfilters.o                                                     \
        ccfifo.o                                                         \
        drawutils.o                                                      \
        formats.o                                                        \
-       framepool.o                                                      \
        framequeue.o                                                     \
        graphdump.o                                                      \
        graphparser.o                                                    \
@@ -207,7 +206,8 @@ OBJS-$(CONFIG_BACKGROUNDKEY_FILTER)          += vf_backgroundkey.o
 OBJS-$(CONFIG_BBOX_FILTER)                   += bbox.o vf_bbox.o
 OBJS-$(CONFIG_BENCH_FILTER)                  += f_bench.o
 OBJS-$(CONFIG_BILATERAL_FILTER)              += vf_bilateral.o
-OBJS-$(CONFIG_BILATERAL_CUDA_FILTER)         += vf_bilateral_cuda.o vf_bilateral_cuda.ptx.o
+OBJS-$(CONFIG_BILATERAL_CUDA_FILTER)         += vf_bilateral_cuda.o vf_bilateral_cuda.ptx.o \
+                                                cuda/load_helper.o
 OBJS-$(CONFIG_BITPLANENOISE_FILTER)          += vf_bitplanenoise.o
 OBJS-$(CONFIG_BLACKDETECT_FILTER)            += vf_blackdetect.o
 OBJS-$(CONFIG_BLACKDETECT_VULKAN_FILTER)     += vf_blackdetect_vulkan.o
@@ -222,14 +222,15 @@ OBJS-$(CONFIG_BOXBLUR_OPENCL_FILTER)         += vf_avgblur_opencl.o opencl.o \
                                                 opencl/avgblur.o boxblur.o
 OBJS-$(CONFIG_BWDIF_FILTER)                  += vf_bwdif.o bwdifdsp.o yadif_common.o
 OBJS-$(CONFIG_BWDIF_CUDA_FILTER)             += vf_bwdif_cuda.o vf_bwdif_cuda.ptx.o \
-                                                yadif_common.o
+                                                yadif_common.o cuda/load_helper.o
 OBJS-$(CONFIG_BWDIF_VULKAN_FILTER)           += vf_bwdif_vulkan.o yadif_common.o vulkan.o vulkan_filter.o
 OBJS-$(CONFIG_CAS_FILTER)                    += vf_cas.o
 OBJS-$(CONFIG_CCREPACK_FILTER)               += vf_ccrepack.o
 OBJS-$(CONFIG_CHROMABER_VULKAN_FILTER)       += vf_chromaber_vulkan.o vulkan.o vulkan_filter.o
 OBJS-$(CONFIG_CHROMAHOLD_FILTER)             += vf_chromakey.o
 OBJS-$(CONFIG_CHROMAKEY_FILTER)              += vf_chromakey.o
-OBJS-$(CONFIG_CHROMAKEY_CUDA_FILTER)         += vf_chromakey_cuda.o vf_chromakey_cuda.ptx.o
+OBJS-$(CONFIG_CHROMAKEY_CUDA_FILTER)         += vf_chromakey_cuda.o vf_chromakey_cuda.ptx.o \
+                                                cuda/load_helper.o
 
 OBJS-$(CONFIG_CHROMANR_FILTER)               += vf_chromanr.o
 OBJS-$(CONFIG_CHROMASHIFT_FILTER)            += vf_chromashift.o
@@ -376,7 +377,8 @@ OBJS-$(CONFIG_LATENCY_FILTER)                += f_latency.o
 OBJS-$(CONFIG_LATTICEPAL_FILTER)             += vf_latticepal.o
 OBJS-$(CONFIG_LENSCORRECTION_FILTER)         += vf_lenscorrection.o
 OBJS-$(CONFIG_LENSFUN_FILTER)                += vf_lensfun.o
-OBJS-$(CONFIG_LIBPLACEBO_FILTER)             += vf_libplacebo.o vulkan.o vulkan_filter.o
+OBJS-$(CONFIG_LIBPLACEBO_FILTER)             += vf_libplacebo.o vulkan.o vulkan_filter.o scale_eval.o
+OBJS-$(CONFIG_LIBPLACEBO_SCENE_FILTER)       += vf_libplacebo.o vulkan.o vulkan_filter.o scale_eval.o
 OBJS-$(CONFIG_LIBVMAF_FILTER)                += vf_libvmaf.o framesync.o
 OBJS-$(CONFIG_LIBVMAF_CUDA_FILTER)           += vf_libvmaf.o framesync.o
 OBJS-$(CONFIG_LIMITDIFF_FILTER)              += vf_limitdiff.o framesync.o
@@ -560,7 +562,7 @@ OBJS-$(CONFIG_UNSHARP_OPENCL_FILTER)         += vf_unsharp_opencl.o opencl.o \
 OBJS-$(CONFIG_UNTILE_FILTER)                 += vf_untile.o
 OBJS-$(CONFIG_USPP_FILTER)                   += vf_uspp.o qp_table.o
 OBJS-$(CONFIG_V360_FILTER)                   += vf_v360.o
-OBJS-$(CONFIG_V360_VULKAN_FILTER)            += vf_v360_vulkan.o
+OBJS-$(CONFIG_V360_VULKAN_FILTER)            += vf_v360_vulkan.o framesync.o
 OBJS-$(CONFIG_VAGUEDENOISER_FILTER)          += vf_vaguedenoiser.o
 OBJS-$(CONFIG_VARBLUR_FILTER)                += vf_varblur.o framesync.o
 OBJS-$(CONFIG_VECTORSCOPE_FILTER)            += vf_vectorscope.o
@@ -670,7 +672,7 @@ OBJS-$(CONFIG_AMOVIE_FILTER)                 += src_movie.o
 OBJS-$(CONFIG_MOVIE_FILTER)                  += src_movie.o
 
 # Objects duplicated from other libraries for shared builds
-SHLIBOBJS                                    += log2_tab.o
+SHLIBOBJS                                    += framepool.o log2_tab.o
 
 # Windows resource file
 SHLIBOBJS-$(HAVE_GNU_WINDRES)                += avfilterres.o

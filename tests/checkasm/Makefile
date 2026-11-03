@@ -36,6 +36,7 @@ AVCODECOBJS-$(CONFIG_AAC_DECODER)       += aacpsdsp.o \
 AVCODECOBJS-$(CONFIG_AAC_ENCODER)       += aacencdsp.o
 AVCODECOBJS-$(CONFIG_ALAC_DECODER)      += alacdsp.o
 AVCODECOBJS-$(CONFIG_APV_DECODER)       += apv_dsp.o
+AVCODECOBJS-$(CONFIG_BITPACKED_DECODER) += bitpackeddec.o
 AVCODECOBJS-$(CONFIG_CAVS_DECODER)      += cavsdsp.o
 AVCODECOBJS-$(CONFIG_DCA_DECODER)       += dcadsp.o synth_filter.o
 AVCODECOBJS-$(CONFIG_DIRAC_DECODER)     += diracdsp.o
@@ -63,7 +64,7 @@ AVCODECOBJS-$(CONFIG_V210_ENCODER)      += v210enc.o
 AVCODECOBJS-$(CONFIG_VORBIS_DECODER)    += vorbisdsp.o
 AVCODECOBJS-$(CONFIG_VP6_DECODER)       += vp6dsp.o
 AVCODECOBJS-$(CONFIG_VP9_DECODER)       += vp9dsp.o
-AVCODECOBJS-$(CONFIG_VVC_DECODER)       += vvc_alf.o vvc_mc.o vvc_sao.o
+AVCODECOBJS-$(CONFIG_VVC_DECODER)       += vvc_alf.o vvc_mc.o vvc_pred.o vvc_sao.o
 
 CHECKASMOBJS-$(CONFIG_AVCODEC)          += $(AVCODECOBJS-yes)
 

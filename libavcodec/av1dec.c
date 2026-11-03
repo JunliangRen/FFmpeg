@@ -437,6 +437,9 @@ static int get_tiles_info(AVCodecContext *avctx, const AV1RawTileGroup *tile_gro
     s->tg_start = tile_group->tg_start;
     s->tg_end = tile_group->tg_end;
 
+    if (tile_group->tg_end >= s->raw_frame_header->tile_cols * s->raw_frame_header->tile_rows)
+        return AVERROR_INVALIDDATA;
+
     for (tile_num = tile_group->tg_start; tile_num <= tile_group->tg_end; tile_num++) {
         tile_row = tile_num / s->raw_frame_header->tile_cols;
         tile_col = tile_num % s->raw_frame_header->tile_cols;
@@ -693,6 +696,15 @@ static int get_pixel_format(AVCodecContext *avctx)
     *fmtp++ = pix_fmt;
     *fmtp = AV_PIX_FMT_NONE;
 
+    /* the negotiated hwaccel can only be kept if the underlying pixel
+     * format did not change, otherwise its surfaces have the wrong format */
+    if (pix_fmt == avctx->sw_pix_fmt)
+        for (int i = 0; pix_fmts[i] != pix_fmt; i++)
+            if (pix_fmts[i] == avctx->pix_fmt) {
+                s->pix_fmt = pix_fmt;
+                return 1;
+            }
+
     ret = ff_get_format(avctx, pix_fmts);
 
     /**
@@ -737,10 +749,9 @@ static void av1_frame_replace(AV1Frame *dst, const AV1Frame *src)
 
     dst->raw_frame_header = src->raw_frame_header;
 
-    ff_progress_frame_replace(&dst->pf, &src->pf);
-
     av_refstruct_replace(&dst->hwaccel_picture_private,
                           src->hwaccel_picture_private);
+    ff_progress_frame_replace(&dst->pf, &src->pf);
 
     dst->spatial_id = src->spatial_id;
     dst->temporal_id = src->temporal_id;
@@ -799,7 +810,6 @@ static av_cold int av1_decode_free(AVCodecContext *avctx)
 static int set_context_with_sequence(AVCodecContext *avctx,
                                      const AV1RawSequenceHeader *seq)
 {
-    AV1DecContext *s = avctx->priv_data;
     int width = seq->max_frame_width_minus_1 + 1;
     int height = seq->max_frame_height_minus_1 + 1;
 
@@ -827,9 +837,7 @@ static int set_context_with_sequence(AVCodecContext *avctx,
         int ret = ff_set_dimensions(avctx, width, height);
         if (ret < 0)
             return ret;
-        s->pix_fmt = AV_PIX_FMT_NONE;
-    } else if (s->pix_fmt != get_sw_pixel_format(avctx, seq))
-        s->pix_fmt = AV_PIX_FMT_NONE;
+    }
 
     if (seq->timing_info_present_flag)
         avctx->framerate = ff_av1_framerate(1LL + seq->timing_info.num_ticks_per_picture_minus_1,
@@ -845,7 +853,6 @@ static int set_context_with_sequence(AVCodecContext *avctx,
 static int update_context_with_frame_header(AVCodecContext *avctx,
                                             const AV1RawFrameHeader *header)
 {
-    AV1DecContext *s = avctx->priv_data;
     AVRational aspect_ratio;
     int width = header->frame_width_minus_1 + 1;
     int height = header->frame_height_minus_1 + 1;
@@ -857,7 +864,6 @@ static int update_context_with_frame_header(AVCodecContext *avctx,
         ret = ff_set_dimensions(avctx, width, height);
         if (ret < 0)
             return ret;
-        s->pix_fmt = AV_PIX_FMT_NONE;
     }
 
     av_reduce(&aspect_ratio.num, &aspect_ratio.den,
@@ -950,6 +956,12 @@ static int av1_frame_alloc(AVCodecContext *avctx, AV1Frame *f)
     AV1RawFrameHeader *header= s->raw_frame_header;
     AVFrame *frame;
     int ret;
+
+    ret = update_context_with_frame_header(avctx, header);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to update context with frame header\n");
+        return ret;
+    }
 
     ret = ff_progress_frame_get_buffer(avctx, &f->pf, AV_GET_BUFFER_FLAG_REF);
     if (ret < 0)
@@ -1120,12 +1132,12 @@ static int export_film_grain(AVCodecContext *avctx, AVFrame *frame)
         aom->ar_coeffs_uv[1][i] = film_grain->ar_coeffs_cr_plus_128[i] - 128;
     }
 
-    aom->uv_mult[0] = film_grain->cb_mult;
-    aom->uv_mult[1] = film_grain->cr_mult;
-    aom->uv_mult_luma[0] = film_grain->cb_luma_mult;
-    aom->uv_mult_luma[1] = film_grain->cr_luma_mult;
-    aom->uv_offset[0] = film_grain->cb_offset;
-    aom->uv_offset[1] = film_grain->cr_offset;
+    aom->uv_mult[0] = film_grain->cb_mult - 128;
+    aom->uv_mult[1] = film_grain->cr_mult - 128;
+    aom->uv_mult_luma[0] = film_grain->cb_luma_mult - 128;
+    aom->uv_mult_luma[1] = film_grain->cr_luma_mult - 128;
+    aom->uv_offset[0] = film_grain->cb_offset - 256;
+    aom->uv_offset[1] = film_grain->cr_offset - 256;
 
     return 0;
 }
@@ -1162,6 +1174,10 @@ static int set_output_frame(AVCodecContext *avctx, AVFrame *frame)
 
     frame->pts = pkt->pts;
     frame->pkt_dts = pkt->dts;
+    if (pkt->flags & AV_PKT_FLAG_DISCARD)
+        frame->flags |= AV_FRAME_FLAG_DISCARD;
+    else
+        frame->flags &= ~AV_FRAME_FLAG_DISCARD;
 
     av_packet_unref(pkt);
 
@@ -1203,12 +1219,6 @@ static int get_current_frame(AVCodecContext *avctx)
              s->raw_frame_header->frame_type != AV1_FRAME_KEY) ||
         avctx->skip_frame >= AVDISCARD_ALL)
         return 0;
-
-    ret = update_context_with_frame_header(avctx, s->raw_frame_header);
-    if (ret < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to update context with frame header\n");
-        return ret;
-    }
 
     if (s->pix_fmt == AV_PIX_FMT_NONE) {
         ret = get_pixel_format(avctx);
@@ -1294,6 +1304,8 @@ static int av1_receive_frame_internal(AVCodecContext *avctx, AVFrame *frame)
             }
 
             s->operating_point_idc = s->raw_seq->operating_point_idc[s->operating_point];
+
+            s->pix_fmt = AV_PIX_FMT_NONE;
 
             if (FF_HW_HAS_CB(avctx, decode_params)) {
                 ret = FF_HW_CALL(avctx, decode_params, AV1_OBU_SEQUENCE_HEADER,

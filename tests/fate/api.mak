@@ -1,3 +1,8 @@
+FATE_API_LIBAVCODEC-$(call ALLYES, AC3_ENCODER AC3_DECODER EAC3_DECODER AC3_FIXED_DECODER) += fate-api-ac3-flush
+fate-api-ac3-flush: $(APITESTSDIR)/api-ac3-flush-test$(EXESUF)
+fate-api-ac3-flush: CMD = run $(APITESTSDIR)/api-ac3-flush-test$(EXESUF)
+fate-api-ac3-flush: CMP = null
+
 FATE_API_LIBAVCODEC-$(call ALLYES, LIBASTCENC_ENCODER LIBASTCENC_DECODER) += fate-api-astc-profile
 fate-api-astc-profile: $(APITESTSDIR)/api-astc-profile-test$(EXESUF)
 fate-api-astc-profile: CMD = run $(APITESTSDIR)/api-astc-profile-test$(EXESUF)
@@ -7,9 +12,17 @@ fate-api-flac: $(APITESTSDIR)/api-flac-test$(EXESUF)
 fate-api-flac: CMD = run $(APITESTSDIR)/api-flac-test$(EXESUF)
 fate-api-flac: CMP = null
 
+FATE_API_LIBAVCODEC-$(CONFIG_PCM_S16LE_DECODER) += fate-api-skip-samples
+fate-api-skip-samples: $(APITESTSDIR)/api-skip-samples-test$(EXESUF)
+fate-api-skip-samples: CMD = run $(APITESTSDIR)/api-skip-samples-test$(EXESUF)
+
 FATE_API_LIBAVCODEC-$(CONFIG_MOVTEXT_ENCODER) += fate-api-movtext
 fate-api-movtext: $(APITESTSDIR)/api-movtext-test$(EXESUF)
 fate-api-movtext: CMD = run $(APITESTSDIR)/api-movtext-test$(EXESUF)
+
+FATE_API_LIBAVCODEC-$(call ALLYES, HEVC_MP4TOANNEXB_BSF HEVC_DECODER) += fate-api-hevc-mp4toannexb
+fate-api-hevc-mp4toannexb: $(APITESTSDIR)/api-hevc-mp4toannexb-test$(EXESUF)
+fate-api-hevc-mp4toannexb: CMD = run $(APITESTSDIR)/api-hevc-mp4toannexb-test$(EXESUF)
 
 FATE_API_LIBAVCODEC-$(call ALLYES, H261_ENCODER H261_PARSER) += fate-api-enc-parser fate-api-enc-parser-cif
 fate-api-enc-parser: $(APITESTSDIR)/api-enc-parser-test$(EXESUF)

@@ -682,7 +682,6 @@ static int new_stream_video(Muxer *mux, const OptionsContext *o,
         const char *frame_pix_fmt = NULL;
         const char *intra_matrix = NULL, *inter_matrix = NULL;
         const char *chroma_intra_matrix = NULL;
-        int do_pass = 0;
         int i;
 
         opt_match_per_stream_str(ost, &o->frame_sizes, oc, st, &frame_size);
@@ -761,67 +760,6 @@ static int new_stream_video(Muxer *mux, const OptionsContext *o,
             if (p) p++;
         }
         video_enc->rc_override_count = i;
-
-        /* two pass mode */
-        opt_match_per_stream_int(ost, &o->pass, oc, st, &do_pass);
-        if (do_pass) {
-            if (do_pass & 1)
-                video_enc->flags |= AV_CODEC_FLAG_PASS1;
-            if (do_pass & 2)
-                video_enc->flags |= AV_CODEC_FLAG_PASS2;
-        }
-
-        opt_match_per_stream_str(ost, &o->passlogfiles, oc, st, &ost->logfile_prefix);
-        if (ost->logfile_prefix &&
-            !(ost->logfile_prefix = av_strdup(ost->logfile_prefix)))
-            return AVERROR(ENOMEM);
-
-        if (do_pass) {
-            int ost_idx = -1;
-            char logfilename[1024];
-            FILE *f;
-
-            /* compute this stream's global index */
-            for (int idx = 0; idx <= ost->file->index; idx++)
-                ost_idx += output_files[idx]->nb_streams;
-
-            snprintf(logfilename, sizeof(logfilename), "%s-%d.log",
-                     ost->logfile_prefix ? ost->logfile_prefix :
-                                           DEFAULT_PASS_LOGFILENAME_PREFIX,
-                     ost_idx);
-            if (!strcmp(video_enc->codec->name, "libx264") || !strcmp(video_enc->codec->name, "libvvenc")) {
-                if (av_opt_is_set_to_default_by_name(video_enc, "stats",
-                                                     AV_OPT_SEARCH_CHILDREN) > 0)
-                    av_opt_set(video_enc, "stats", logfilename,
-                               AV_OPT_SEARCH_CHILDREN);
-            } else if (!strcmp(video_enc->codec->name, "libx265")) {
-                if (av_opt_is_set_to_default_by_name(video_enc, "x265-stats",
-                                                     AV_OPT_SEARCH_CHILDREN) > 0)
-                    av_opt_set(video_enc, "x265-stats", logfilename,
-                               AV_OPT_SEARCH_CHILDREN);
-            } else {
-                if (video_enc->flags & AV_CODEC_FLAG_PASS2) {
-                    char  *logbuffer = read_file_to_string(logfilename);
-
-                    if (!logbuffer) {
-                        av_log(ost, AV_LOG_FATAL, "Error reading log file '%s' for pass-2 encoding\n",
-                               logfilename);
-                        return AVERROR(EIO);
-                    }
-                    video_enc->stats_in = logbuffer;
-                }
-                if (video_enc->flags & AV_CODEC_FLAG_PASS1) {
-                    f = fopen_utf8(logfilename, "wb");
-                    if (!f) {
-                        av_log(ost, AV_LOG_FATAL,
-                               "Cannot write log file '%s' for pass-1 encoding: %s\n",
-                               logfilename, strerror(errno));
-                        return AVERROR(errno);
-                    }
-                    ost->logfile = f;
-                }
-            }
-        }
 
         opt_match_per_stream_int(ost, &o->force_fps, oc, st, &ms->force_fps);
 
@@ -972,6 +910,7 @@ ost_bind_filter(const Muxer *mux, MuxStream *ms, OutputFilter *ofilter,
         .color_space      = enc_ctx->colorspace,
         .color_range      = enc_ctx->color_range,
         .alpha_mode       = enc_ctx->alpha_mode,
+        .chroma_location  = enc_ctx->chroma_sample_location,
         .vsync_method     = vsync_method,
         .frame_rate       = ms->frame_rate,
         .max_frame_rate   = ms->max_frame_rate,
@@ -1023,6 +962,11 @@ ost_bind_filter(const Muxer *mux, MuxStream *ms, OutputFilter *ofilter,
         ret = avcodec_get_supported_config(enc_ctx, NULL,
                                            AV_CODEC_CONFIG_ALPHA_MODE, 0,
                                            (const void **) &opts.alpha_modes, NULL);
+        if (ret < 0)
+            return ret;
+        ret = avcodec_get_supported_config(enc_ctx, NULL,
+                                           AV_CODEC_CONFIG_CHROMA_LOCATION, 0,
+                                           (const void **) &opts.chroma_locations, NULL);
         if (ret < 0)
             return ret;
     } else {
@@ -1557,9 +1501,12 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
     }
 
     opt_match_per_stream_dbl(ost, &o->qscale, oc, st, &qscale);
-    if (ost->enc && qscale >= 0) {
-        ost->enc->flags          |= AV_CODEC_FLAG_QSCALE;
-        ost->enc->global_quality  = FF_QP2LAMBDA * qscale;
+    if (ost->enc) {
+        if (qscale >= 0) {
+            ost->enc->flags          |= AV_CODEC_FLAG_QSCALE;
+            ost->enc->global_quality  = FF_QP2LAMBDA * qscale;
+        } else
+            ost->enc->global_quality  = ost->enc->enc_ctx->global_quality;
     }
 
     if (ms->sch_idx >= 0) {
@@ -1595,6 +1542,73 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
     }
     if (ret < 0)
         goto fail;
+
+
+    if (ost->enc) {
+        AVCodecContext *enc = ost->enc->enc_ctx;
+        int do_pass = 0;
+
+        /* two pass mode */
+        opt_match_per_stream_int(ost, &o->pass, oc, st, &do_pass);
+        if (do_pass) {
+            if (do_pass & 1)
+                enc->flags |= AV_CODEC_FLAG_PASS1;
+            if (do_pass & 2)
+                enc->flags |= AV_CODEC_FLAG_PASS2;
+        }
+
+        opt_match_per_stream_str(ost, &o->passlogfiles, oc, st, &ost->logfile_prefix);
+        if (ost->logfile_prefix &&
+            !(ost->logfile_prefix = av_strdup(ost->logfile_prefix)))
+            return AVERROR(ENOMEM);
+
+        if (do_pass) {
+            int ost_idx = -1;
+            char logfilename[1024];
+            FILE *f;
+
+            /* compute this stream's global index */
+            for (int idx = 0; idx <= ost->file->index; idx++)
+                ost_idx += output_files[idx]->nb_streams;
+
+            snprintf(logfilename, sizeof(logfilename), "%s-%d.log",
+                     ost->logfile_prefix ? ost->logfile_prefix :
+                                           DEFAULT_PASS_LOGFILENAME_PREFIX,
+                     ost_idx);
+            if (!strcmp(enc->codec->name, "libx264") || !strcmp(enc->codec->name, "libvvenc")) {
+                if (av_opt_is_set_to_default_by_name(enc, "stats",
+                                                     AV_OPT_SEARCH_CHILDREN) > 0)
+                    av_opt_set(enc, "stats", logfilename,
+                               AV_OPT_SEARCH_CHILDREN);
+            } else if (!strcmp(enc->codec->name, "libx265")) {
+                if (av_opt_is_set_to_default_by_name(enc, "x265-stats",
+                                                     AV_OPT_SEARCH_CHILDREN) > 0)
+                    av_opt_set(enc, "x265-stats", logfilename,
+                               AV_OPT_SEARCH_CHILDREN);
+            } else {
+                if (enc->flags & AV_CODEC_FLAG_PASS2) {
+                    char  *logbuffer = read_file_to_string(logfilename);
+
+                    if (!logbuffer) {
+                        av_log(ost, AV_LOG_FATAL, "Error reading log file '%s' for pass-2 encoding\n",
+                               logfilename);
+                        return AVERROR(EIO);
+                    }
+                    enc->stats_in = logbuffer;
+                }
+                if (enc->flags & AV_CODEC_FLAG_PASS1) {
+                    f = fopen_utf8(logfilename, "wb");
+                    if (!f) {
+                        av_log(ost, AV_LOG_FATAL,
+                               "Cannot write log file '%s' for pass-1 encoding: %s\n",
+                               logfilename, strerror(errno));
+                        return AVERROR(errno);
+                    }
+                    ost->logfile = f;
+                }
+            }
+        }
+    }
 
     if (ost->enc &&
         (type == AVMEDIA_TYPE_VIDEO || type == AVMEDIA_TYPE_AUDIO)) {
@@ -1654,6 +1668,25 @@ fail:
     return ret;
 }
 
+static int64_t score_new_packets_event_flag(const AVStreamGroup *stg)
+{
+    int64_t score = 0;
+
+    for (int j = 0; j < stg->nb_entries; j++) {
+        if (stg->entries[j]->type != AV_STREAM_GROUP_ENTRY_STREAM)
+            continue;
+
+        AVStream *st = stg->entries[j]->stream;
+
+        if (st->event_flags & AVSTREAM_EVENT_FLAG_NEW_PACKETS) {
+            score += 100000000;
+            break;
+        }
+    }
+
+    return score;
+}
+
 static int map_auto_video(Muxer *mux, const OptionsContext *o)
 {
     AVFormatContext *oc = mux->fc;
@@ -1674,24 +1707,32 @@ static int map_auto_video(Muxer *mux, const OptionsContext *o)
         int64_t file_best_score = 0;
         for (int i = 0; i < ifile->nb_stream_groups; i++) {
             InputStreamGroup *istg = ifile->stream_groups[i];
-            int64_t score = 0;
+            int64_t score;
 
             if (!istg->fg)
                 continue;
 
-            for (int j = 0; j < istg->stg->nb_streams; j++) {
-                AVStream *st = istg->stg->streams[j];
-
-                if (st->event_flags & AVSTREAM_EVENT_FLAG_NEW_PACKETS) {
-                    score = 100000000;
-                    break;
-                }
-            }
+            score = score_new_packets_event_flag(istg->stg);
 
             switch (istg->stg->type) {
             case AV_STREAM_GROUP_PARAMS_TILE_GRID: {
                 const AVStreamGroupTileGrid *tg = istg->stg->params.tile_grid;
                 score += tg->width * (int64_t)tg->height
+                           + 5000000*!!(istg->stg->disposition & AV_DISPOSITION_DEFAULT);
+                break;
+            }
+            case AV_STREAM_GROUP_PARAMS_ALPHA: {
+                const AVStreamGroupLayeredVideo *layered_video = istg->stg->params.layered_video;
+                for (int k = 0; k < istg->stg->nb_entries; k++) {
+                    const AVStreamGroupEntry *entry = istg->stg->entries[k];
+                    int disposition = entry->type == AV_STREAM_GROUP_ENTRY_STREAM
+                                       ? entry->stream->disposition
+                                       : entry->stream_group->disposition;
+                    if (istg->stg->entries[k]->type == AV_STREAM_GROUP_ENTRY_STREAM_GROUP)
+                        score += score_new_packets_event_flag(entry->stream_group);
+                    score += 5000000*!!(disposition & AV_DISPOSITION_DEFAULT);
+                }
+                score += layered_video->width * (int64_t)layered_video->height
                            + 5000000*!!(istg->stg->disposition & AV_DISPOSITION_DEFAULT);
                 break;
             }
@@ -1711,7 +1752,8 @@ static int map_auto_video(Muxer *mux, const OptionsContext *o)
 
             if (ist->user_set_discard == AVDISCARD_ALL ||
                 ist->st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO ||
-                (desc && (desc->props & AV_CODEC_PROP_ENHANCEMENT)))
+                (desc && (ifile->nb_streams > 1 || nb_input_files > 1) &&
+                 (desc->props & AV_CODEC_PROP_ENHANCEMENT)))
                 continue;
 
             score = ist->st->codecpar->width * (int64_t)ist->st->codecpar->height
@@ -2472,7 +2514,10 @@ static int of_serialize_options(Muxer *mux, void *obj, AVBPrint *bp)
     char *ptr;
     int ret;
 
-    ret = av_opt_serialize(obj, 0, AV_OPT_SERIALIZE_SKIP_DEFAULTS | AV_OPT_SERIALIZE_SEARCH_CHILDREN,
+    ret = av_opt_serialize(obj, AV_OPT_FLAG_DEPRECATED,
+                           AV_OPT_SERIALIZE_SKIP_DEFAULTS |
+                           AV_OPT_SERIALIZE_SEARCH_CHILDREN |
+                           AV_OPT_SERIALIZE_OPT_FLAGS_EXCLUDE,
                            &ptr, '=', ':');
     if (ret < 0) {
         av_log(mux, AV_LOG_ERROR, "Failed to serialize group\n");
@@ -2727,8 +2772,8 @@ static int of_parse_group_token(Muxer *mux, const char *token, char *ptr)
             ret = AVERROR(EINVAL);
             goto end;
         }
-        for (unsigned i = 0; i < oc->stream_groups[idx]->nb_streams; i++) {
-            ret = avformat_stream_group_add_stream(stg, oc->stream_groups[idx]->streams[i]);
+        for (unsigned i = 0; i < oc->stream_groups[idx]->nb_entries; i++) {
+            ret = avformat_stream_group_add_stream(stg, oc->stream_groups[idx]->entries[i]->stream);
             if (ret < 0)
                 goto end;
         }

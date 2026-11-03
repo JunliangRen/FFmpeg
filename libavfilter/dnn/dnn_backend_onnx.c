@@ -25,6 +25,7 @@
 
 #include "libavutil/opt.h"
 #include "libavutil/avassert.h"
+#include "libavutil/detection_bbox.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/avstring.h"
@@ -40,6 +41,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#if CONFIG_DNN_ONNX_D3D12
+#include "libavutil/hwcontext.h"
+#include "libavutil/hwcontext_d3d12va.h"
+#include "dnn_onnx_d3d12.h"
+#endif
+
 typedef struct ONNXModel {
     DNNModel model;
     DnnContext *ctx;
@@ -53,6 +60,9 @@ typedef struct ONNXModel {
     DNNData input_info;
     int     input_resolved;
     int     output_resolved;
+#if CONFIG_DNN_ONNX_D3D12
+    DnnOnnxD3D12Ctx *hw_ctx;
+#endif
 } ONNXModel;
 
 typedef struct ONNXInferRequest {
@@ -60,6 +70,10 @@ typedef struct ONNXInferRequest {
     OrtValue **output_tensors;
     uint32_t   nb_outputs;
     void      *input_data;
+#if CONFIG_DNN_ONNX_D3D12
+    void     *hw_in_tensor;
+    void     *hw_out_tensor;
+#endif
 } ONNXInferRequest;
 
 typedef struct ONNXRequestItem {
@@ -97,25 +111,106 @@ static void init_ort_api(void)
         }                                                       \
     } while (0)
 
-static int extract_lltask_from_task(TaskItem *task, Queue *lltask_queue)
+static int contain_valid_detection_bbox(AVFrame *frame)
+{
+    AVFrameSideData *sd;
+    const AVDetectionBBoxHeader *header;
+    const AVDetectionBBox *bbox;
+
+    sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DETECTION_BBOXES);
+    if (!sd)
+        return 0;
+
+    if (!sd->size)
+        return 0;
+
+    header = (const AVDetectionBBoxHeader *)sd->data;
+    if (!header->nb_bboxes)
+        return 0;
+
+    for (uint32_t i = 0; i < header->nb_bboxes; i++) {
+        bbox = av_get_detection_bbox(header, i);
+        if (bbox->x < 0 || bbox->w < 0 || bbox->x + bbox->w > frame->width)
+            return 0;
+        if (bbox->y < 0 || bbox->h < 0 || bbox->y + bbox->h > frame->height)
+            return 0;
+        if (bbox->classify_count == AV_NUM_DETECTION_BBOX_CLASSIFY)
+            return 0;
+    }
+
+    return 1;
+}
+
+static int extract_lltask_from_task(DNNFunctionType func_type, TaskItem *task,
+                                    Queue *lltask_queue, DNNExecBaseParams *exec_params)
 {
     ONNXModel     *onnx_model = (ONNXModel *)task->model;
     DnnContext           *ctx = onnx_model->ctx;
-    LastLevelTaskItem *lltask = av_malloc(sizeof(*lltask));
 
-    if (!lltask) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to allocate memory for LastLevelTaskItem\n");
-        return AVERROR(ENOMEM);
+    switch (func_type) {
+    case DFT_PROCESS_FRAME:
+    case DFT_ANALYTICS_DETECT:
+    {
+        LastLevelTaskItem *lltask = av_malloc(sizeof(*lltask));
+        if (!lltask) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to allocate memory for LastLevelTaskItem\n");
+            return AVERROR(ENOMEM);
+        }
+        task->inference_todo = 1;
+        task->inference_done = 0;
+        lltask->task = task;
+        if (ff_queue_push_back(lltask_queue, lltask) < 0) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to push back lltask_queue.\n");
+            av_freep(&lltask);
+            return AVERROR(ENOMEM);
+        }
+        return 0;
     }
-    task->inference_todo = 1;
-    task->inference_done = 0;
-    lltask->task = task;
-    if (ff_queue_push_back(lltask_queue, lltask) < 0) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to push back lltask_queue.\n");
-        av_freep(&lltask);
-        return AVERROR(ENOMEM);
+    case DFT_ANALYTICS_CLASSIFY:
+    {
+        const AVDetectionBBoxHeader *header;
+        AVFrame *frame = task->in_frame;
+        AVFrameSideData *sd;
+        DNNExecClassificationParams *params = (DNNExecClassificationParams *)exec_params;
+
+        task->inference_todo = 0;
+        task->inference_done = 0;
+
+        if (!contain_valid_detection_bbox(frame))
+            return 0;
+
+        sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DETECTION_BBOXES);
+        header = (const AVDetectionBBoxHeader *)sd->data;
+
+        for (uint32_t i = 0; i < header->nb_bboxes; i++) {
+            LastLevelTaskItem *lltask;
+            const AVDetectionBBox *bbox = av_get_detection_bbox(header, i);
+
+            if (params->target) {
+                if (av_strncasecmp(bbox->detect_label, params->target, sizeof(bbox->detect_label)) != 0)
+                    continue;
+            }
+
+            lltask = av_malloc(sizeof(*lltask));
+            if (!lltask) {
+                av_log(ctx, AV_LOG_ERROR, "Failed to allocate memory for LastLevelTaskItem\n");
+                return AVERROR(ENOMEM);
+            }
+            task->inference_todo++;
+            lltask->task = task;
+            lltask->bbox_index = i;
+            if (ff_queue_push_back(lltask_queue, lltask) < 0) {
+                av_log(ctx, AV_LOG_ERROR, "Failed to push back lltask_queue.\n");
+                av_freep(&lltask);
+                return AVERROR(ENOMEM);
+            }
+        }
+        return 0;
     }
-    return 0;
+    default:
+        avpriv_report_missing_feature(ctx, "model function type %d", func_type);
+        return AVERROR(ENOSYS);
+    }
 }
 
 static void onnx_free_request(ONNXInferRequest *request)
@@ -137,6 +232,11 @@ static void onnx_free_request(ONNXInferRequest *request)
         av_freep(&request->output_tensors);
     }
     request->nb_outputs = 0;
+#if CONFIG_DNN_ONNX_D3D12
+    /* Borrowed references owned by ONNXModel.hw_ctx; never release here. */
+    request->hw_in_tensor  = NULL;
+    request->hw_out_tensor = NULL;
+#endif
 }
 
 static inline void destroy_request_item(ONNXRequestItem **arg)
@@ -173,6 +273,10 @@ static void dnn_free_model_onnx(DNNModel **model)
     }
     ff_queue_destroy(onnx_model->lltask_queue);
 
+#if CONFIG_DNN_ONNX_D3D12
+    ff_dnn_onnx_d3d12_sync(onnx_model->hw_ctx);
+#endif
+
     while (ff_queue_size(onnx_model->task_queue) != 0) {
         TaskItem *item = (TaskItem *)ff_queue_pop_front(onnx_model->task_queue);
         av_frame_free(&item->in_frame);
@@ -188,9 +292,60 @@ static void dnn_free_model_onnx(DNNModel **model)
     if (onnx_model->env)
         g_ort->ReleaseEnv(onnx_model->env);
 
+#if CONFIG_DNN_ONNX_D3D12
+    /* Must be released after the session and session_options above have
+     * let go of the DirectML device and shared command queue it wraps. */
+    ff_dnn_onnx_d3d12_free(&onnx_model->hw_ctx);
+#endif
+
     av_freep(&onnx_model);
     *model = NULL;
 }
+
+#if CONFIG_DNN_ONNX_D3D12
+static void append_d3d12_dml_ep(ONNXModel *onnx_model)
+{
+    DnnContext *ctx = onnx_model->ctx;
+    AVHWFramesContext *frames_ctx;
+    AVHWDeviceContext *dev_ctx;
+    AVD3D12VADeviceContext *d3d12_hwctx;
+    int is_uma = 0;
+
+    if (!ctx->hw_frames_ctx)
+        return;
+
+    frames_ctx = (AVHWFramesContext *)ctx->hw_frames_ctx->data;
+    dev_ctx = frames_ctx->device_ctx;
+    if (dev_ctx->type != AV_HWDEVICE_TYPE_D3D12VA) {
+        av_log(ctx, AV_LOG_WARNING,
+               "dnn_onnx_d3d12: hw_frames_ctx is not backed by a D3D12VA "
+               "device; falling back to host I/O\n");
+        return;
+    }
+    d3d12_hwctx = (AVD3D12VADeviceContext *)dev_ctx->hwctx;
+
+    if (ff_dnn_onnx_d3d12_probe(d3d12_hwctx->device, DNN_ONNX_D3D12_TENSOR_GPU, &is_uma, ctx) < 0)
+        return;
+
+    onnx_model->hw_ctx = ff_dnn_onnx_d3d12_create(d3d12_hwctx->device, DNN_ONNX_D3D12_TENSOR_GPU, ctx);
+    if (!onnx_model->hw_ctx)
+        return;
+
+    if (ff_dnn_onnx_d3d12_append_ep(onnx_model->hw_ctx, onnx_model->session_options) < 0) {
+        av_log(ctx, AV_LOG_WARNING,
+               "Failed to register the DirectML EP on the frames' D3D12 "
+               "device; D3D12 hardware-frame input will fail to configure, "
+               "only software-frame input can use the default-device DirectML EP\n");
+        ff_dnn_onnx_d3d12_free(&onnx_model->hw_ctx);
+        return;
+    }
+
+    ctx->zero_copy_negotiated = 1;
+    av_log(ctx, AV_LOG_INFO,
+           "Using DirectML execution provider on the frames' own D3D12 device%s\n",
+           is_uma ? " (UMA)" : "");
+}
+#endif
 
 static int get_input_onnx(DNNModel *model, DNNData *input, const char *input_name)
 {
@@ -395,6 +550,31 @@ static int fill_model_input_onnx(ONNXModel *onnx_model, ONNXRequestItem *request
     input_shape[2] = input.dims[height_idx];
     input_shape[3] = input.dims[width_idx];
 
+#if CONFIG_DNN_ONNX_D3D12
+    /*
+     * task->in_frame may lack hw_frames_ctx (e.g. get_output_onnx()'s
+     * shape probe); such frames fall through to the host-memory tensor
+     * path, which still works via the DML EP from
+     * ff_dnn_onnx_d3d12_append_ep(), just without zero-copy.
+     */
+    if (ctx->zero_copy_negotiated && task->in_frame->hw_frames_ctx) {
+        ret = ff_dnn_onnx_d3d12_config(onnx_model->hw_ctx,
+                                        task->in_frame->width, task->in_frame->height,
+                                        task->out_frame->width, task->out_frame->height,
+                                        input.dt, input.layout, input.dims[channel_idx]);
+        if (ret < 0)
+            goto err;
+
+        ret = ff_dnn_onnx_d3d12_fill_input(onnx_model->hw_ctx, task->in_frame,
+                                            &infer_request->hw_in_tensor,
+                                            &infer_request->hw_out_tensor);
+        if (ret < 0)
+            goto err;
+
+        return 0;
+    }
+#endif
+
     /*
      * Build the byte count with checked size_t multiplications instead of
      * multiplying four int64_t shape values in one expression.
@@ -432,6 +612,11 @@ static int fill_model_input_onnx(ONNXModel *onnx_model, ONNXRequestItem *request
         break;
     case DFT_ANALYTICS_DETECT:
         ret = ff_frame_to_dnn_detect(task->in_frame, &input, ctx);
+        if (ret < 0)
+            goto err;
+        break;
+    case DFT_ANALYTICS_CLASSIFY:
+        ret = ff_frame_to_dnn_classify(task->in_frame, &input, lltask->bbox_index, ctx);
         if (ret < 0)
             goto err;
         break;
@@ -498,6 +683,14 @@ static int onnx_start_inference(void *args)
         return AVERROR(EINVAL);
     }
 
+#if CONFIG_DNN_ONNX_D3D12
+    if (infer_request->hw_in_tensor) {
+        if (!infer_request->hw_out_tensor) {
+            av_log(ctx, AV_LOG_ERROR, "D3D12 output tensor is NULL\n");
+            return DNN_GENERIC_ERROR;
+        }
+    } else
+#endif
     if (!infer_request->input_tensor) {
         av_log(ctx, AV_LOG_ERROR, "Input tensor is NULL\n");
         return DNN_GENERIC_ERROR;
@@ -544,6 +737,15 @@ static int onnx_start_inference(void *args)
 
     input_names[0] = task->input_name;
 
+#if CONFIG_DNN_ONNX_D3D12
+    if (infer_request->hw_in_tensor) {
+        return ff_dnn_onnx_d3d12_run(onnx_model->hw_ctx, onnx_model->session,
+                                      input_names[0], task->output_names[0],
+                                      infer_request->hw_in_tensor,
+                                      infer_request->hw_out_tensor);
+    }
+#endif
+
     /* ORT writes task->nb_output result handles into this array; it must be
      * allocated (and NULL-initialised) before Run() so ORT owns each slot. */
     av_freep(&infer_request->output_tensors);
@@ -589,6 +791,17 @@ static void infer_completion_callback(void *args)
     int64_t *dims;
     OrtStatus *status;
     int ret;
+
+#if CONFIG_DNN_ONNX_D3D12
+    if (infer_request->hw_in_tensor) {
+        ret = ff_dnn_onnx_d3d12_writeback(onnx_model->hw_ctx, task->out_frame);
+        if (ret < 0)
+            av_log(ctx, AV_LOG_ERROR, "D3D12 writeback failed (%d)\n", ret);
+        else
+            task->inference_done++;
+        goto err;
+    }
+#endif
 
     outputs = av_calloc(infer_request->nb_outputs, sizeof(*outputs));
     if (!outputs) {
@@ -658,6 +871,16 @@ static void infer_completion_callback(void *args)
             goto err;
         }
 
+        if (i == 0 && ctx->zero_copy_negotiated && onnx_model->model.func_type == DFT_PROCESS_FRAME &&
+            (num_dims != 4 || dims[1] != 1)) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "D3D12 zero-copy requires a [1,1,H,W] output tensor, got rank %zu with dims[1]=%"PRId64"\n",
+                   num_dims, num_dims > 1 ? dims[1] : 0);
+            av_free(dims);
+            g_ort->ReleaseTensorTypeAndShapeInfo(tensor_info);
+            goto err;
+        }
+
         /* Output is interpreted as NCHW, matching the input assumption. */
         outputs[i].layout = DL_NCHW;
         outputs[i].order  = DCO_RGB;
@@ -673,9 +896,30 @@ static void infer_completion_callback(void *args)
             outputs[i].dims[1] = 1;
             outputs[i].dims[2] = dims[1];
             outputs[i].dims[3] = dims[2];
+        } else if (num_dims == 2) {
+            /* [N, C] -> [N, C, 1, 1] */
+            outputs[i].dims[0] = dims[0];
+            outputs[i].dims[1] = dims[1];
+            outputs[i].dims[2] = 1;
+            outputs[i].dims[3] = 1;
+        } else if (num_dims == 1) {
+            /* [C] -> [1, C, 1, 1] */
+            outputs[i].dims[0] = 1;
+            outputs[i].dims[1] = dims[0];
+            outputs[i].dims[2] = 1;
+            outputs[i].dims[3] = 1;
         } else {
             avpriv_report_missing_feature(ctx,
                 "Support for %zu-dimensional output (tensor[%u])", num_dims, i);
+            av_free(dims);
+            g_ort->ReleaseTensorTypeAndShapeInfo(tensor_info);
+            goto err;
+        }
+
+        if (outputs[i].dims[0] != 1) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Output tensor[%u] batch size %d unsupported, must be 1\n",
+                   i, outputs[i].dims[0]);
             av_free(dims);
             g_ort->ReleaseTensorTypeAndShapeInfo(tensor_info);
             goto err;
@@ -715,6 +959,15 @@ static void infer_completion_callback(void *args)
         if (ret < 0)
             goto err;
         break;
+    case DFT_ANALYTICS_CLASSIFY:
+        if (!onnx_model->model.classify_post_proc) {
+            av_log(ctx, AV_LOG_ERROR, "classify filter needs to provide classify_post_proc\n");
+            goto err;
+        }
+        onnx_model->model.classify_post_proc(task->in_frame, outputs,
+                                             request->lltask->bbox_index,
+                                             onnx_model->model.filter_ctx);
+        break;
     default:
         avpriv_report_missing_feature(ctx, "model function type %d", onnx_model->model.func_type);
         goto err;
@@ -732,44 +985,53 @@ err:
     }
 }
 
-static int execute_model_onnx(ONNXRequestItem *request, Queue *lltask_queue)
+static int execute_model_onnx(ONNXModel *onnx_model, ONNXRequestItem *request, Queue *lltask_queue)
 {
-    ONNXModel *onnx_model = NULL;
     LastLevelTaskItem *lltask;
     TaskItem *task = NULL;
     int ret = 0;
 
     if (ff_queue_size(lltask_queue) == 0) {
-        destroy_request_item(&request);
+        if (ff_safe_queue_push_back(onnx_model->request_queue, request) < 0) {
+            destroy_request_item(&request);
+        }
         return 0;
     }
 
-    lltask = (LastLevelTaskItem *)ff_queue_peek_front(lltask_queue);
-    if (lltask == NULL) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to get LastLevelTaskItem\n");
-        destroy_request_item(&request);
-        return AVERROR(EINVAL);
-    }
-    task = lltask->task;
-    onnx_model = (ONNXModel *)task->model;
+    /* Drain all lltasks for the current frame. */
+    for (;;) {
+        lltask = (LastLevelTaskItem *)ff_queue_peek_front(lltask_queue);
+        if (lltask == NULL) {
+            av_log(NULL, AV_LOG_ERROR, "Failed to get LastLevelTaskItem\n");
+            ret = AVERROR(EINVAL);
+            goto err;
+        }
+        task = lltask->task;
 
-    ret = fill_model_input_onnx(onnx_model, request);
-    if (ret != 0) {
-        goto err;
-    }
+        ret = fill_model_input_onnx(onnx_model, request);
+        if (ret != 0) {
+            goto err;
+        }
 
-    if (task->async) {
-        avpriv_report_missing_feature(onnx_model->ctx, "ONNX async inference");
-        ret = AVERROR(ENOSYS);
-        goto err;
-    } else {
+        if (task->async) {
+            avpriv_report_missing_feature(onnx_model->ctx, "ONNX async inference");
+            ret = AVERROR(ENOSYS);
+            goto err;
+        }
+
         ret = onnx_start_inference((void *)request);
         if (ret != 0) {
             goto err;
         }
         infer_completion_callback(request);
-        return (task->inference_done == task->inference_todo) ? 0 : DNN_GENERIC_ERROR;
+
+        if (ff_queue_size(lltask_queue) == 0) {
+            break;
+        }
+        request = (ONNXRequestItem *)ff_safe_queue_pop_front(onnx_model->request_queue);
     }
+
+    return (task->inference_done == task->inference_todo) ? 0 : DNN_GENERIC_ERROR;
 
 err:
     av_freep(&request->lltask);
@@ -801,7 +1063,7 @@ static int get_output_onnx(DNNModel *model, const char *input_name, int input_wi
         goto err;
     }
 
-    ret = extract_lltask_from_task(&task, onnx_model->lltask_queue);
+    ret = extract_lltask_from_task(DFT_PROCESS_FRAME, &task, onnx_model->lltask_queue, NULL);
     if (ret != 0) {
         av_log(ctx, AV_LOG_ERROR, "Unable to extract last level task from task.\n");
         goto err;
@@ -814,7 +1076,7 @@ static int get_output_onnx(DNNModel *model, const char *input_name, int input_wi
         goto err;
     }
 
-    ret = execute_model_onnx(request, onnx_model->lltask_queue);
+    ret = execute_model_onnx(onnx_model, request, onnx_model->lltask_queue);
     *output_width = task.out_frame->width;
     *output_height = task.out_frame->height;
 
@@ -879,6 +1141,12 @@ static DNNModel *dnn_load_model_onnx(DnnContext *ctx, DNNFunctionType func_type,
     }
     g_ort->SetSessionGraphOptimizationLevel(onnx_model->session_options, ORT_ENABLE_ALL);
 
+    /*
+     * device=dml is registered below exactly like cuda/vitisai, but with
+     * one extra detail: if ctx->hw_frames_ctx is already set,
+     * append_d3d12_dml_ep() binds the DirectML EP directly to that D3D12
+     * device, instead of letting ONNX Runtime pick its own default one.
+     */
     if (ctx->device && av_strcasecmp(ctx->device, "cpu") != 0) {
         if (av_strcasecmp(ctx->device, "cuda") == 0) {
             if (g_ort->SessionOptionsAppendExecutionProvider_CUDA) {
@@ -916,7 +1184,16 @@ static DNNModel *dnn_load_model_onnx(DnnContext *ctx, DNNFunctionType func_type,
             if (status)
                 g_ort->ReleaseStatus(status);
 
-            if (g_ort->SessionOptionsAppendExecutionProvider) {
+#if CONFIG_DNN_ONNX_D3D12
+            /* No-op unless the filter already set ctx->hw_frames_ctx via
+             * ff_dnn_set_hw_frames_ctx(); if set, binds the DirectML EP to
+             * that device so tensor I/O can stay in VRAM. */
+            append_d3d12_dml_ep(onnx_model);
+#endif
+
+            if (ctx->zero_copy_negotiated) {
+                /* Device-bound DirectML EP already appended above. */
+            } else if (g_ort->SessionOptionsAppendExecutionProvider) {
                 status = g_ort->SessionOptionsAppendExecutionProvider(
                     onnx_model->session_options, "DML",
                     dml_options_keys, dml_options_values, 1);
@@ -1174,10 +1451,15 @@ static int dnn_execute_model_onnx(const DNNModel *model, DNNExecBaseParams *exec
         return ret;
     }
 
-    ret = extract_lltask_from_task(task, onnx_model->lltask_queue);
+    ret = extract_lltask_from_task(model->func_type, task, onnx_model->lltask_queue, exec_params);
     if (ret != 0) {
         av_log(ctx, AV_LOG_ERROR, "Unable to extract last level task from task.\n");
         return ret;
+    }
+
+    /* No lltasks queued, nothing to infer. */
+    if (ff_queue_size(onnx_model->lltask_queue) == 0) {
+        return 0;
     }
 
     request = (ONNXRequestItem *)ff_safe_queue_pop_front(onnx_model->request_queue);
@@ -1186,7 +1468,7 @@ static int dnn_execute_model_onnx(const DNNModel *model, DNNExecBaseParams *exec
         return AVERROR(EINVAL);
     }
 
-    return execute_model_onnx(request, onnx_model->lltask_queue);
+    return execute_model_onnx(onnx_model, request, onnx_model->lltask_queue);
 }
 
 static DNNAsyncStatusType dnn_get_result_onnx(const DNNModel *model, AVFrame **in, AVFrame **out)
@@ -1209,7 +1491,7 @@ static int dnn_flush_onnx(const DNNModel *model)
         return AVERROR(EINVAL);
     }
 
-    return execute_model_onnx(request, onnx_model->lltask_queue);
+    return execute_model_onnx(onnx_model, request, onnx_model->lltask_queue);
 }
 
 const DNNModule ff_dnn_backend_onnx = {
